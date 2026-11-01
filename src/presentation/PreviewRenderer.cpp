@@ -1,6 +1,7 @@
 #include "emuscale/presentation/PreviewRenderer.h"
 
 #include <d3dcompiler.h>
+#include <dxgi1_5.h>
 #include <algorithm>
 #include <stdexcept>
 #include <string>
@@ -89,6 +90,12 @@ void PreviewRenderer::initialize(HWND window) {
     check(adapter->GetDesc(&description), "GetDesc");
     gpu_name_ = description.Description;
     check(adapter->GetParent(IID_PPV_ARGS(&factory)), "IDXGIFactory2 query");
+    Microsoft::WRL::ComPtr<IDXGIFactory5> factory5;
+    if (SUCCEEDED(factory.As(&factory5))) {
+        BOOL supported = FALSE;
+        tearing_supported_ = SUCCEEDED(factory5->CheckFeatureSupport(
+            DXGI_FEATURE_PRESENT_ALLOW_TEARING, &supported, sizeof(supported))) && supported;
+    }
 
     RECT rect{};
     GetClientRect(window, &rect);
@@ -102,6 +109,7 @@ void PreviewRenderer::initialize(HWND window) {
     chain.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     chain.BufferCount = 2;
     chain.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    chain.Flags = tearing_supported_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
     check(factory->CreateSwapChainForHwnd(device_.Get(), window, &chain, nullptr,
                                           nullptr, &swap_chain_), "CreateSwapChainForHwnd");
     factory->MakeWindowAssociation(window, DXGI_MWA_NO_ALT_ENTER);
@@ -137,7 +145,8 @@ void PreviewRenderer::resize(UINT width, UINT height) {
     context_->OMSetRenderTargets(0, nullptr, nullptr);
     target_.Reset();
     context_->ClearState();
-    check(swap_chain_->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0), "ResizeBuffers");
+    check(swap_chain_->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN,
+        tearing_supported_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0), "ResizeBuffers");
     width_ = width;
     height_ = height;
     create_target();
@@ -204,6 +213,8 @@ void PreviewRenderer::present(ID3D11Texture2D* source, UINT content_width, UINT 
     context_->Draw(3, 0);
     ID3D11ShaderResourceView* empty = nullptr;
     context_->PSSetShaderResources(0, 1, &empty);
-    check(swap_chain_->Present(1, 0), "Present");
+    const auto policy = present_policy(vsync_, tearing_supported_);
+    check(swap_chain_->Present(policy.sync_interval,
+        policy.allow_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0), "Present");
 }
 } // namespace emuscale

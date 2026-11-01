@@ -16,7 +16,8 @@ using namespace winrt::Windows::Graphics::DirectX;
 WindowCapture::~WindowCapture() { stop(); }
 
 void WindowCapture::start(HWND target, HWND notify, ID3D11Device* device,
-                          std::shared_ptr<CaptureStats> stats) {
+                          std::shared_ptr<CaptureStats> stats,
+                          std::shared_ptr<FrameMetrics> metrics) {
     stop();
     if (!IsWindow(target) || !device || !notify) throw std::invalid_argument("Invalid capture target or device");
     if (!GraphicsCaptureSession::IsSupported()) throw std::runtime_error("Windows Graphics Capture is unavailable");
@@ -24,6 +25,7 @@ void WindowCapture::start(HWND target, HWND notify, ID3D11Device* device,
     auto shared = std::make_shared<Shared>();
     shared->notify = notify;
     shared->stats = std::move(stats);
+    shared->metrics = std::move(metrics);
 
     auto factory = winrt::get_activation_factory<GraphicsCaptureItem>();
     auto interop = factory.as<IGraphicsCaptureItemInterop>();
@@ -51,8 +53,14 @@ void WindowCapture::start(HWND target, HWND notify, ID3D11Device* device,
         Shared::CallbackGuard guard(*state);
         if (state->paused.load(std::memory_order_acquire)) return;
         try {
+            LARGE_INTEGER counter{}, frequency{};
+            QueryPerformanceCounter(&counter);
+            QueryPerformanceFrequency(&frequency);
+            state->metrics->on_callback(counter.QuadPart, frequency.QuadPart);
             auto frame = sender.TryGetNextFrame();
             if (!frame) return;
+            state->metrics->on_frame(frame.SystemRelativeTime().count(),
+                counter.QuadPart, frequency.QuadPart);
             const auto size = frame.ContentSize();
             state->stats->captured.fetch_add(1, std::memory_order_relaxed);
             if (size.Width > 0 && size.Height > 0) {

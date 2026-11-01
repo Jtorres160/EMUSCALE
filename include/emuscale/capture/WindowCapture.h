@@ -1,5 +1,6 @@
 #pragma once
 #include "emuscale/core/CaptureStats.h"
+#include "emuscale/core/FrameMetrics.h"
 #include <d3d11.h>
 #include <windows.h>
 #include <winrt/Windows.Graphics.Capture.h>
@@ -24,7 +25,8 @@ public:
     WindowCapture& operator=(const WindowCapture&) = delete;
 
     void start(HWND target, HWND notify, ID3D11Device* device,
-               std::shared_ptr<CaptureStats> stats);
+               std::shared_ptr<CaptureStats> stats,
+               std::shared_ptr<FrameMetrics> metrics);
     void stop() noexcept;
     [[nodiscard]] std::optional<winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame> take_frame();
     void resize_pool(winrt::Windows::Graphics::SizeInt32 size);
@@ -36,6 +38,7 @@ private:
         std::optional<Frame> latest;
         HWND notify = nullptr;
         std::shared_ptr<CaptureStats> stats;
+        std::shared_ptr<FrameMetrics> metrics;
         std::atomic<bool> paused{false};
         std::atomic<unsigned> active_callbacks{0};
         std::condition_variable callbacks_done;

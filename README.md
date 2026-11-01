@@ -4,7 +4,7 @@ EmuScale RTX is a Windows emulator enhancement project for NVIDIA GTX 900, GTX 1
 
 ## Current state
 
-This workspace was empty when the compatibility update began. It now contains a C++20 capability library, Windows DXGI/D3D11 GPU enumeration, a GPU information console tool, independent future backend interfaces, a conservative selection policy, and policy tests. The v0.1 executable includes an emulator window selector, Windows Graphics Capture session, and a D3D11 live preview. It has been built and tested against Eden on Windows; see the validation record below. NIS processing, DLSS, and frame generation remain disabled. See [the architecture](docs/ARCHITECTURE.md).
+The project contains a C++20 capability library, Windows DXGI/D3D11 GPU enumeration, a GPU information console tool, independent future backend interfaces, a conservative selection policy, and policy tests. The v0.1.1 executable includes an emulator window selector, Windows Graphics Capture session, D3D11 live preview, FPS controls, and benchmark logging. NIS processing, DLSS, and frame generation remain disabled. See [the architecture](docs/ARCHITECTURE.md).
 
 The detector enumerates physical DXGI adapters, records vendor/device IDs and D3D11 feature level, and returns separate `hardware`, `sdk`, and `integration` states for each backend. `unknown` is never treated as available. NIS is the intended default once its shader integration exists; today selection safely falls back to the unprocessed capture path. Conservative compatibility mode permits only verified NIS and otherwise uses that same path. Native and custom frame generation never substitute for each other silently.
 
@@ -22,7 +22,7 @@ This is a *target matrix*, not a list of currently working features. The detecto
 
 NIS uses the current color frame and is appropriate for external capture. Native DLSS Super Resolution needs renderer data such as motion vectors and temporal state. A captured image alone cannot supply those inputs. Use currently supported DLSS SDK models when renderer integration is built, selecting a quality/performance mode based on measured cost and SDK support. Do not force old DLSS 1 or 2 implementations. Keep custom interpolation separate from NVIDIA DLSS Frame Generation.
 
-## Build and run v0.1
+## Build and run v0.1.1
 
 Install Visual Studio 2022 with **Desktop development with C++**, the MSVC x64 toolset, a Windows 10/11 SDK version 19041 or newer (including C++/WinRT headers), and CMake tools. Windows 10 version 1903 or newer is required for window capture; Windows 11 is supported. In a Developer PowerShell for VS 2022:
 
@@ -32,7 +32,13 @@ cmake --build build --config Debug
 ctest --test-dir build -C Debug --output-on-failure
 ```
 
-Launch Eden, leave its game window visible and restored, then run `build\Debug\emuscale_rtx.exe`. Select the numbered Eden window from the console list. A separate preview window should display live captured frames. Its title reports the active GPU, captured and presented FPS, overwritten frames, and capture/output dimensions. Close either window to stop; restarting the program is required to choose a different target. Other visible top-level application windows can also be selected. Run `build\Debug\emuscale_gpu_info.exe` to inspect detected adapters and independent capability states; add `--compatibility=conservative` for compatibility mode (`automatic` is the default).
+Launch Eden, leave its game window visible and restored, then run `build\Debug\emuscale_rtx.exe`. Select the numbered Eden window from the console list. The preview and a separate settings window open. The settings window can be hidden and reopened with F1 while the preview is focused. Close the preview to stop; restarting the program is required to choose a different target. Other visible top-level application windows can also be selected. Run `build\Debug\emuscale_gpu_info.exe` to inspect detected adapters and independent capability states; add `--compatibility=conservative` for compatibility mode (`automatic` is the default).
+
+FPS Limit offers Auto, 30, 60, 90, 120, 144, 165, 240, and Unlocked. Auto is the default: it does not add a software cap, and the displayed target is the preview monitor's refresh rate. Unlocked also has no software cap and displays its target as Unlocked. The numeric choices cap presentation of new capture frames; they cannot create extra source frames or alter emulator speed. VSync Auto and On use synchronized presentation. Off requests unsynchronized presentation and uses DXGI tearing only when the system reports support. It may visibly tear. The renderer does not repeatedly present the same captured frame to fill a higher target FPS.
+
+The settings panel reports capture callbacks, distinct Windows Graphics Capture timestamps, presented FPS, separate average source timestamp/callback/presentation intervals, 1% low FPS (after enough samples), pacing variation, overwritten mailbox frames, repeated timestamps, capped frames, and generated frames (always zero in v0.1.1). A distinct capture timestamp is **not** proof that the underlying game image changed. These are capture and presentation measurements, not emulator internal FPS or input latency. The 1% low and pacing statistics use up to ten seconds of presentation intervals; the FPS counters use a one second window. Mailbox overwrites count only frames replaced inside this application. The diagnostic line identifies an active numeric cap or a possible preview/capture rate mismatch; it cannot distinguish an emulator limit from a game limit or prove a GPU processing bottleneck. Raising a game's own FPS may require external, game-specific configuration. Windows Graphics Capture cannot universally unlock emulator or game FPS.
+
+Benchmark mode supports 30, 60, or 120 seconds. Start Benchmark records one metrics row per second and automatically saves a CSV to `build\Debug\benchmarks` when time expires. Stop and Export CSV ends a run early; closing the preview also exports an active run. The CSV includes elapsed time, distinct timestamp FPS, callback FPS, presented FPS, target FPS, separate timing averages, 1% low, pacing deviation, cumulative drop/repeat/cap counts, GPU, dimensions, and VSync setting. Benchmarking observes the capture path only; it does not control Eden or gameplay timing.
 
 The preview is SDR BGRA8. Protected content, minimized targets, inaccessible windows, and capture-disabled systems may produce no frames or an error. The program makes no claim about end-to-end input latency or GPU processing cost. An overwritten frame count measures frames replaced in the application's one-frame mailbox; it is not a count of every frame lost upstream. Qt 6 and NVIDIA SDKs are not required for v0.1. The build requires Windows; non-Windows configuration fails intentionally.
 
@@ -43,8 +49,8 @@ On Windows with an NVIDIA GeForce RTX 4080 SUPER, the x64 Debug build passed and
 ## Next development milestones
 
 1. **v0.1 capture:** Eden selection, real preview frames, aspect-preserving resize, changing capture dimensions, source closure, and clean process exit were observed on one Windows system. Device removal and long-duration resource use still need targeted validation.
-2. **v0.2 NIS:** integrate NVIDIA's NIS shader SDK, validate input/output formats and output sizes, add sharpening and measured GPU cost. Use it as the default supported enhancement with unprocessed fallback.
-3. **v0.3 diagnostics:** timestamp real and presented frames, report drops, pacing and processing cost. Label latency estimates separately from measurements.
+2. **v0.1.1 FPS controls and benchmark:** numeric presentation caps, VSync choice, separate capture and presentation metrics, and CSV export. Texture-content uniqueness, end-to-end latency, and long-duration performance still require validation.
+3. **v0.2 NIS:** integrate NVIDIA's NIS shader SDK, validate input/output formats and output sizes, add sharpening and measured GPU cost. Use it as the default supported enhancement with unprocessed fallback.
 4. **v0.4 experimental custom interpolation:** first validate NVIDIA Optical Flow SDK support on the selected adapter. Research a D3D11 compute or shader motion estimation and synthesis path for GTX 1080 Ti and other unsupported GPUs. Benchmark artifact rate, queue depth, latency, and pacing before exposing controls. Optical flow vectors alone do not create finished frames.
 5. **Later native integration:** add renderer-specific interfaces for DLSS Super Resolution, Frame Generation, and Multi Frame Generation only when the renderer supplies required resources and Streamline reports support. Capture alone is insufficient.
 
