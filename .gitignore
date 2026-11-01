@@ -1,0 +1,66 @@
+# CMake and build output
+/build/
+/out/
+/cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+compile_commands.json
+Makefile
+
+# Visual Studio and MSVC
+.vs/
+*.sln
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.obj
+*.pch
+*.pdb
+*.ilk
+*.ipch
+*.idb
+*.tlog
+*.lastbuildstate
+*.recipe
+
+# Compiled and SDK binaries
+*.exe
+*.dll
+*.lib
+*.exp
+*.a
+*.so
+*.dylib
+*.pyd
+*.zip
+*.7z
+
+# Temporary files and development tools
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+.cursor/
+.codex/
+
+# Local configuration and secrets
+.env
+.env.*
+*.pem
+*.pfx
+*.p12
+*.key
+credentials.json
+secrets.json
+secrets.*
