@@ -4,7 +4,7 @@ EmuScale RTX is a Windows emulator enhancement project for NVIDIA GTX 900, GTX 1
 
 ## Current state
 
-This workspace was empty when the compatibility update began. It now contains a C++20 capability library, Windows DXGI/D3D11 GPU enumeration, a GPU information console tool, independent future backend interfaces, a conservative selection policy, and policy tests. The v0.1 source now includes an emulator window selector, Windows Graphics Capture session, and a D3D11 live preview. **The capture executable has not yet been compiled or tested on Windows.** NIS processing, DLSS, and frame generation remain disabled. See [the architecture](docs/ARCHITECTURE.md).
+This workspace was empty when the compatibility update began. It now contains a C++20 capability library, Windows DXGI/D3D11 GPU enumeration, a GPU information console tool, independent future backend interfaces, a conservative selection policy, and policy tests. The v0.1 executable includes an emulator window selector, Windows Graphics Capture session, and a D3D11 live preview. It has been built and tested against Eden on Windows; see the validation record below. NIS processing, DLSS, and frame generation remain disabled. See [the architecture](docs/ARCHITECTURE.md).
 
 The detector enumerates physical DXGI adapters, records vendor/device IDs and D3D11 feature level, and returns separate `hardware`, `sdk`, and `integration` states for each backend. `unknown` is never treated as available. NIS is the intended default once its shader integration exists; today selection safely falls back to the unprocessed capture path. Conservative compatibility mode permits only verified NIS and otherwise uses that same path. Native and custom frame generation never substitute for each other silently.
 
@@ -36,9 +36,13 @@ Launch Eden, leave its game window visible and restored, then run `build\Debug\e
 
 The preview is SDR BGRA8. Protected content, minimized targets, inaccessible windows, and capture-disabled systems may produce no frames or an error. The program makes no claim about end-to-end input latency or GPU processing cost. An overwritten frame count measures frames replaced in the application's one-frame mailbox; it is not a count of every frame lost upstream. Qt 6 and NVIDIA SDKs are not required for v0.1. The build requires Windows; non-Windows configuration fails intentionally.
 
+### Validation record — 2026-11-01
+
+On Windows with an NVIDIA GeForce RTX 4080 SUPER, the x64 Debug build passed and CTest passed (1/1). Eden v0.2.1 was detected with The Legend of Zelda: Tears of the Kingdom running. The preview showed changing gameplay frames at roughly 27–32 captured FPS and 27–32 presented FPS, with zero application mailbox overwrites in the observed samples. Resizing the preview from 1264×721 to 757×721 kept the image visible and aspect-correct. Changing Eden's capture dimensions from 2560×1440 to 1922×1157 did not interrupt capture. After Eden was closed through its normal confirmation dialog, the preview disappeared and `emuscale_rtx.exe` exited with code 0. This single session does not establish long-term leak or performance behavior on other GPUs and emulators.
+
 ## Next development milestones
 
-1. **v0.1 capture:** compile and test the new capture executable on Windows. Verify Eden selection, real preview frames, aspect ratio, resizing, source closure, device failure, and cleanup. This milestone remains unverified until that test passes.
+1. **v0.1 capture:** Eden selection, real preview frames, aspect-preserving resize, changing capture dimensions, source closure, and clean process exit were observed on one Windows system. Device removal and long-duration resource use still need targeted validation.
 2. **v0.2 NIS:** integrate NVIDIA's NIS shader SDK, validate input/output formats and output sizes, add sharpening and measured GPU cost. Use it as the default supported enhancement with unprocessed fallback.
 3. **v0.3 diagnostics:** timestamp real and presented frames, report drops, pacing and processing cost. Label latency estimates separately from measurements.
 4. **v0.4 experimental custom interpolation:** first validate NVIDIA Optical Flow SDK support on the selected adapter. Research a D3D11 compute or shader motion estimation and synthesis path for GTX 1080 Ti and other unsupported GPUs. Benchmark artifact rate, queue depth, latency, and pacing before exposing controls. Optical flow vectors alone do not create finished frames.
