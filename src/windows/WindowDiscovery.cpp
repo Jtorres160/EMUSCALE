@@ -58,4 +58,18 @@ std::vector<WindowInfo> discover_windows() {
 bool capturable_window(HWND handle) noexcept {
     return handle && IsWindow(handle) && IsWindowVisible(handle) && !IsIconic(handle);
 }
+bool eden_process_name(std::wstring name) {
+    std::transform(name.begin(), name.end(), name.begin(), [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
+    return name == L"eden.exe" || name == L"eden" || (name.starts_with(L"eden-") && name.ends_with(L".exe"));
+}
+std::vector<WindowInfo> eden_windows() {
+    auto windows = discover_windows();
+    std::erase_if(windows, [](const WindowInfo& w) { return !eden_process_name(w.process_name) || !capturable_window(w.handle); });
+    // Never guess among multiple main windows, even when one title mentions TotK.
+    return windows;
+}
+bool declared_totk_title(std::wstring title) {
+    std::transform(title.begin(), title.end(), title.begin(), [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
+    return title.find(L"tears of the kingdom") != std::wstring::npos || title.find(L"totk") != std::wstring::npos;
+}
 } // namespace emuscale

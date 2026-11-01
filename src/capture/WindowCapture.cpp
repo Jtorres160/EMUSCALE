@@ -67,15 +67,18 @@ void WindowCapture::start(HWND target, HWND notify, ID3D11Device* device,
                 state->stats->capture_width.store(size.Width, std::memory_order_relaxed);
                 state->stats->capture_height.store(size.Height, std::memory_order_relaxed);
             }
+            bool notify = false;
             {
                 std::lock_guard lock(state->mutex);
+                notify = !state->latest.has_value();
                 if (state->latest) {
                     state->latest->Close();
                     state->stats->overwritten.fetch_add(1, std::memory_order_relaxed);
                 }
                 state->latest = std::move(frame);
             }
-            PostMessageW(state->notify, capture_frame_message, 0, 0);
+            // One notification for the one-frame mailbox, even if Present stalls.
+            if (notify) PostMessageW(state->notify, capture_frame_message, 0, 0);
         } catch (const winrt::hresult_error& error) {
             state->stats->capture_hresult.store(error.code(), std::memory_order_relaxed);
             state->stats->capture_failed.store(true, std::memory_order_relaxed);

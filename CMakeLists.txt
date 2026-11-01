@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(EmuScaleRTX VERSION 0.1.1 LANGUAGES CXX)
+project(EmuScaleRTX VERSION 0.1.2 LANGUAGES CXX)
 
 if(NOT WIN32)
     message(FATAL_ERROR "EmuScale RTX currently requires Windows")
@@ -13,15 +13,18 @@ add_library(emuscale_capabilities STATIC
     src/core/WindowsGpuProbe.cpp
     src/core/FramePacing.cpp
     src/core/FrameMetrics.cpp
-    src/core/Benchmark.cpp)
+    src/core/Benchmark.cpp
+    src/core/Diagnostics.cpp
+    src/windows/DisplayInventory.cpp
+    src/windows/WindowDiscovery.cpp)
 target_compile_features(emuscale_capabilities PUBLIC cxx_std_20)
 target_include_directories(emuscale_capabilities PUBLIC include)
-target_link_libraries(emuscale_capabilities PRIVATE dxgi d3d11)
-target_compile_definitions(emuscale_capabilities PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(emuscale_capabilities PRIVATE dxgi d3d11 user32 shcore psapi pdh)
+target_compile_definitions(emuscale_capabilities PUBLIC WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE
+    _WIN32_WINNT=0x0A00 WINVER=0x0A00)
 
 add_executable(emuscale_rtx
     src/app/EmuScaleMain.cpp
-    src/windows/WindowDiscovery.cpp
     src/capture/WindowCapture.cpp
     src/presentation/PreviewRenderer.cpp)
 target_compile_features(emuscale_rtx PRIVATE cxx_std_20)
@@ -33,6 +36,8 @@ target_link_libraries(emuscale_rtx PRIVATE emuscale_capabilities d3d11 dxgi
 
 add_executable(emuscale_gpu_info src/app/GpuInfoMain.cpp)
 target_link_libraries(emuscale_gpu_info PRIVATE emuscale_capabilities)
+add_executable(emuscale_analyze src/app/AnalyzeMain.cpp)
+target_link_libraries(emuscale_analyze PRIVATE emuscale_capabilities)
 
 option(EMUSCALE_BUILD_TESTS "Build capability policy tests" ON)
 if(EMUSCALE_BUILD_TESTS)
@@ -43,4 +48,25 @@ if(EMUSCALE_BUILD_TESTS)
     add_executable(pacing_tests tests/PacingTests.cpp)
     target_link_libraries(pacing_tests PRIVATE emuscale_capabilities)
     add_test(NAME pacing_tests COMMAND pacing_tests)
+    add_executable(diagnostic_tests tests/DiagnosticTests.cpp)
+    target_link_libraries(diagnostic_tests PRIVATE emuscale_capabilities)
+    add_test(NAME diagnostic_tests COMMAND diagnostic_tests)
+    add_test(NAME diagnostics_help COMMAND emuscale_rtx --help)
+    add_test(NAME diagnostics_B_requires_ready COMMAND emuscale_rtx --diagnostics --scenario=B)
+    add_test(NAME diagnostics_C_requires_ready COMMAND emuscale_rtx --diagnostics --scenario=C)
+    add_test(NAME diagnostics_B_rejects_disabled_optimizer COMMAND emuscale_rtx --diagnostics --scenario=B --ready --optimizer=disabled --scene=test)
+    add_test(NAME diagnostics_A_requires_unlocked COMMAND emuscale_rtx --diagnostics --limit=60)
+    add_test(NAME diagnostics_rejects_malformed_duration COMMAND emuscale_rtx --diagnostics --duration=60oops)
+    add_test(NAME analyzer_rejects_missing_session COMMAND emuscale_analyze __missing_session__)
+    set_tests_properties(diagnostics_B_requires_ready diagnostics_C_requires_ready
+        diagnostics_B_rejects_disabled_optimizer diagnostics_A_requires_unlocked
+        diagnostics_rejects_malformed_duration analyzer_rejects_missing_session PROPERTIES WILL_FAIL TRUE)
+    # Tests use assert, including Release configurations.
+    foreach(test_target capability_tests pacing_tests diagnostic_tests)
+        if(MSVC)
+            target_compile_options(${test_target} PRIVATE /UNDEBUG)
+        else()
+            target_compile_options(${test_target} PRIVATE -UNDEBUG)
+        endif()
+    endforeach()
 endif()

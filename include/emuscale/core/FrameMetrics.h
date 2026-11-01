@@ -14,6 +14,10 @@ struct MetricsSnapshot {
     double average_present_ms = 0;
     double one_percent_low_fps = 0;
     double pacing_stddev_ms = 0;
+    double max_present_interval_ms = 0;
+    double average_capture_to_present_ms = -1; // no valid clock-correlated samples
+    std::uint64_t pacing_spikes_total = 0;
+    std::uint64_t missing_timestamp_total = 0;
     std::uint64_t distinct_capture_total = 0;
     std::uint64_t callback_total = 0;
     std::uint64_t presented_total = 0;
@@ -29,7 +33,7 @@ public:
     void on_callback(std::int64_t now_qpc, std::int64_t frequency);
     void on_frame(std::int64_t compositor_ticks, std::int64_t now_qpc,
                   std::int64_t frequency);
-    void on_present(std::int64_t now_qpc, std::int64_t frequency);
+    void on_present(std::int64_t now_qpc, std::int64_t frequency, std::int64_t source_ticks = 0);
     void on_capped() noexcept;
     [[nodiscard]] MetricsSnapshot snapshot(std::int64_t now_qpc,
                                            std::int64_t frequency) const;
@@ -40,6 +44,9 @@ private:
     std::deque<std::int64_t> presentations_;
     std::deque<std::pair<std::int64_t, double>> source_intervals_;
     std::deque<std::pair<std::int64_t, double>> callback_intervals_;
+    std::deque<std::pair<std::int64_t, double>> delays_;
+    std::deque<std::pair<std::int64_t, double>> present_intervals_;
+    std::uint64_t spikes_ = 0, missing_ = 0;
     std::int64_t last_compositor_ticks_ = 0;
     std::int64_t last_callback_qpc_ = 0;
     std::uint64_t callback_total_ = 0, distinct_total_ = 0;

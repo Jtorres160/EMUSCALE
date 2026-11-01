@@ -152,13 +152,13 @@ void PreviewRenderer::resize(UINT width, UINT height) {
     create_target();
 }
 
-void PreviewRenderer::present(ID3D11Texture2D* source, UINT content_width, UINT content_height) {
-    if (!source || !target_ || !content_width || !content_height) return;
+bool PreviewRenderer::present(ID3D11Texture2D* source, UINT content_width, UINT content_height) {
+    if (!source || !target_ || !content_width || !content_height) return false;
     D3D11_TEXTURE2D_DESC source_desc{};
     source->GetDesc(&source_desc);
     content_width = std::min(content_width, source_desc.Width);
     content_height = std::min(content_height, source_desc.Height);
-    if (!content_width || !content_height) return;
+    if (!content_width || !content_height) return false;
 
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> view;
     HRESULT hr = device_->CreateShaderResourceView(source, nullptr, &view);
@@ -214,7 +214,9 @@ void PreviewRenderer::present(ID3D11Texture2D* source, UINT content_width, UINT 
     ID3D11ShaderResourceView* empty = nullptr;
     context_->PSSetShaderResources(0, 1, &empty);
     const auto policy = present_policy(vsync_, tearing_supported_);
-    check(swap_chain_->Present(policy.sync_interval,
-        policy.allow_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0), "Present");
+    const HRESULT presented = swap_chain_->Present(policy.sync_interval,
+        policy.allow_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
+    check(presented, "Present");
+    return presented == S_OK;
 }
 } // namespace emuscale

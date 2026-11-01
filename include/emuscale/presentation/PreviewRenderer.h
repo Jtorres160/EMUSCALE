@@ -11,7 +11,7 @@ class PreviewRenderer {
 public:
     void initialize(HWND window);
     void resize(UINT width, UINT height);
-    void present(ID3D11Texture2D* source, UINT content_width, UINT content_height);
+    bool present(ID3D11Texture2D* source, UINT content_width, UINT content_height);
     void set_vsync(VSyncMode mode) noexcept { vsync_ = mode; }
     [[nodiscard]] VSyncMode vsync() const noexcept { return vsync_; }
     [[nodiscard]] bool tearing_supported() const noexcept { return tearing_supported_; }
