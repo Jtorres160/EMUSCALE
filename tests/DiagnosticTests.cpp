@@ -60,10 +60,17 @@ int main() {
     const auto folder = session.directory();
     assert(std::filesystem::file_size(folder / "metrics.csv") > 1000); // progressive I/O, before stop
     session.stop("synthetic test finished");
+    session.stop("idempotent shutdown");
     assert(!session.failed()); assert(!session.active());
     const auto summary = analyze_session(folder);
     assert(summary.find("0 invalid rows") != std::string::npos);
     assert(summary.find("clean session-end event") != std::string::npos);
+    assert(summary.find("P95 ms") != std::string::npos);
+    assert(summary.find("0 invalid timing/marker rows") != std::string::npos);
+    assert(summary.find("Marker correlation") != std::string::npos);
+    assert(std::filesystem::file_size(folder / "timings.csv") > 1000);
+    { std::ofstream malformed(folder / "timings.csv", std::ios::app); malformed << "nan,capture,0,20,1,33.3,50\n"; }
+    assert(analyze_session(folder).find("1 invalid timing/marker rows") != std::string::npos);
     std::ifstream event_file(folder / "events.jsonl"); std::stringstream event_text; event_text << event_file.rdbuf(); event_file.close();
     assert(event_text.str().find("Stuttering observed") != std::string::npos);
     { std::ofstream malformed(folder / "metrics.csv", std::ios::app); malformed << "broken,row\n"; }

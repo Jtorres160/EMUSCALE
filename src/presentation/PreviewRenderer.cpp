@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <string>
 #include <sstream>
+#include <cmath>
 
 namespace emuscale {
 namespace {
@@ -80,6 +81,7 @@ void PreviewRenderer::initialize(HWND window) {
     }
     if (!device_) hr = create_device(nullptr);
     check(hr, "D3D11CreateDevice");
+    processing_.initialize(device_.Get(), context_.Get());
 
     Microsoft::WRL::ComPtr<IDXGIDevice> dxgi;
     Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
@@ -152,13 +154,18 @@ void PreviewRenderer::resize(UINT width, UINT height) {
     create_target();
 }
 
-bool PreviewRenderer::present(ID3D11Texture2D* source, UINT content_width, UINT content_height) {
-    if (!source || !target_ || !content_width || !content_height) return false;
-    D3D11_TEXTURE2D_DESC source_desc{};
+PreviewRenderer::PresentResult PreviewRenderer::present(ID3D11Texture2D* source, UINT content_width, UINT content_height, std::int64_t timestamp) {
+    if (!source || !target_ || !content_width || !content_height) return {};
+    D3D11_TEXTURE2D_DESC source_desc{}; source->GetDesc(&source_desc);
+    content_width = std::min(content_width, source_desc.Width); content_height = std::min(content_height, source_desc.Height);
+    const auto requested = aspect_viewport({content_width, content_height}, {width_, height_});
+    auto processed = processing_.process({source, {content_width, content_height}, timestamp},
+        {std::max(1u, static_cast<unsigned>(std::lround(requested.width))), std::max(1u, static_cast<unsigned>(std::lround(requested.height)))});
+    source = processed.output.texture.Get(); content_width = processed.output.content.width; content_height = processed.output.content.height;
     source->GetDesc(&source_desc);
     content_width = std::min(content_width, source_desc.Width);
     content_height = std::min(content_height, source_desc.Height);
-    if (!content_width || !content_height) return false;
+    if (!content_width || !content_height) return {};
 
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> view;
     HRESULT hr = device_->CreateShaderResourceView(source, nullptr, &view);
@@ -182,15 +189,10 @@ bool PreviewRenderer::present(ID3D11Texture2D* source, UINT content_width, UINT 
               "CreateShaderResourceView");
     }
 
-    const float src_aspect = static_cast<float>(content_width) / content_height;
-    const float dst_aspect = static_cast<float>(width_) / height_;
+    const auto fitted = aspect_viewport({content_width, content_height}, {width_, height_});
     D3D11_VIEWPORT viewport{};
-    viewport.Width = static_cast<float>(width_);
-    viewport.Height = static_cast<float>(height_);
-    if (dst_aspect > src_aspect) viewport.Width = viewport.Height * src_aspect;
-    else viewport.Height = viewport.Width / src_aspect;
-    viewport.TopLeftX = (width_ - viewport.Width) * 0.5f;
-    viewport.TopLeftY = (height_ - viewport.Height) * 0.5f;
+    viewport.Width = static_cast<float>(fitted.width); viewport.Height = static_cast<float>(fitted.height);
+    viewport.TopLeftX = static_cast<float>(fitted.x); viewport.TopLeftY = static_cast<float>(fitted.y);
     viewport.MaxDepth = 1.0f;
     struct { float u, v, pad0, pad1; } scales{
         static_cast<float>(content_width) / source_desc.Width,
@@ -203,6 +205,9 @@ bool PreviewRenderer::present(ID3D11Texture2D* source, UINT content_width, UINT 
     auto* sampler = sampler_.Get();
     auto* constants = constants_.Get();
     context_->OMSetRenderTargets(1, &render_target, nullptr);
+    context_->RSSetState(nullptr); context_->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+    context_->OMSetDepthStencilState(nullptr, 0); context_->IASetInputLayout(nullptr);
+    context_->GSSetShader(nullptr, nullptr, 0); context_->HSSetShader(nullptr, nullptr, 0); context_->DSSetShader(nullptr, nullptr, 0);
     context_->RSSetViewports(1, &viewport);
     context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     context_->VSSetShader(vertex_shader_.Get(), nullptr, 0);
@@ -216,7 +221,6 @@ bool PreviewRenderer::present(ID3D11Texture2D* source, UINT content_width, UINT 
     const auto policy = present_policy(vsync_, tearing_supported_);
     const HRESULT presented = swap_chain_->Present(policy.sync_interval,
         policy.allow_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
-    check(presented, "Present");
-    return presented == S_OK;
+    return {true, presented, std::move(processed)};
 }
 } // namespace emuscale

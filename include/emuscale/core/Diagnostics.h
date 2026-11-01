@@ -17,6 +17,7 @@ struct DiagnosticConfig {
     std::string scenario = "A", optimizer = "disabled", scene = "unspecified";
     bool ready = false, tearing_supported = false;
     int duration_seconds = 0;
+    double warning_threshold_ms = 33.3, spike_threshold_ms = 50;
     std::uintmax_t session_limit_bytes = 32 * 1024 * 1024;
     std::uintmax_t storage_limit_bytes = 256 * 1024 * 1024;
 };
@@ -25,6 +26,9 @@ struct DiagnosticRuntime {
     std::atomic<int> fps_limit{static_cast<int>(FpsLimit::unlocked)};
     std::atomic<int> vsync{static_cast<int>(VSyncMode::automatic)};
     std::atomic<unsigned> output_width{0}, output_height{0};
+    std::atomic<unsigned> topology_generation{0};
+    std::atomic<double> processing_cpu_ms{0}, processing_gpu_ms{-1};
+    std::atomic<std::uint64_t> processing_fallbacks{0}, processing_gpu_sequence{0};
 };
 class DiagnosticSession {
 public:

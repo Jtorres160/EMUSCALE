@@ -1,5 +1,6 @@
 #pragma once
 #include "emuscale/core/FramePacing.h"
+#include "emuscale/graphics/ProcessingPipeline.h"
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <windows.h>
@@ -11,7 +12,9 @@ class PreviewRenderer {
 public:
     void initialize(HWND window);
     void resize(UINT width, UINT height);
-    bool present(ID3D11Texture2D* source, UINT content_width, UINT content_height);
+    struct PresentResult { bool called = false; HRESULT status = S_FALSE; ProcessingResult processing; };
+    PresentResult present(ID3D11Texture2D* source, UINT content_width, UINT content_height, std::int64_t source_timestamp = 0);
+    void set_processor(std::unique_ptr<IGpuProcessor> processor) { processing_.set_processor(std::move(processor)); }
     void set_vsync(VSyncMode mode) noexcept { vsync_ = mode; }
     [[nodiscard]] VSyncMode vsync() const noexcept { return vsync_; }
     [[nodiscard]] bool tearing_supported() const noexcept { return tearing_supported_; }
@@ -21,6 +24,7 @@ public:
     [[nodiscard]] UINT height() const noexcept { return height_; }
 
 private:
+    ProcessingPipeline processing_;
     void create_target();
     Microsoft::WRL::ComPtr<ID3D11Device> device_;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;

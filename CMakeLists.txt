@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(EmuScaleRTX VERSION 0.1.2 LANGUAGES CXX)
+project(EmuScaleRTX VERSION 0.1.3 LANGUAGES CXX)
 
 if(NOT WIN32)
     message(FATAL_ERROR "EmuScale RTX currently requires Windows")
@@ -15,6 +15,9 @@ add_library(emuscale_capabilities STATIC
     src/core/FrameMetrics.cpp
     src/core/Benchmark.cpp
     src/core/Diagnostics.cpp
+    src/core/TimingAnalysis.cpp
+    src/graphics/ProcessingPipeline.cpp
+    src/windows/DisplayPolicy.cpp
     src/windows/DisplayInventory.cpp
     src/windows/WindowDiscovery.cpp)
 target_compile_features(emuscale_capabilities PUBLIC cxx_std_20)
@@ -51,6 +54,15 @@ if(EMUSCALE_BUILD_TESTS)
     add_executable(diagnostic_tests tests/DiagnosticTests.cpp)
     target_link_libraries(diagnostic_tests PRIVATE emuscale_capabilities)
     add_test(NAME diagnostic_tests COMMAND diagnostic_tests)
+    add_executable(timing_tests tests/TimingTests.cpp)
+    target_link_libraries(timing_tests PRIVATE emuscale_capabilities)
+    add_test(NAME timing_tests COMMAND timing_tests)
+    add_executable(display_policy_tests tests/DisplayPolicyTests.cpp)
+    target_link_libraries(display_policy_tests PRIVATE emuscale_capabilities)
+    add_test(NAME display_policy_tests COMMAND display_policy_tests)
+    add_executable(processing_tests tests/ProcessingTests.cpp)
+    target_link_libraries(processing_tests PRIVATE emuscale_capabilities)
+    add_test(NAME processing_tests COMMAND processing_tests)
     add_test(NAME diagnostics_help COMMAND emuscale_rtx --help)
     add_test(NAME diagnostics_B_requires_ready COMMAND emuscale_rtx --diagnostics --scenario=B)
     add_test(NAME diagnostics_C_requires_ready COMMAND emuscale_rtx --diagnostics --scenario=C)
@@ -58,11 +70,14 @@ if(EMUSCALE_BUILD_TESTS)
     add_test(NAME diagnostics_A_requires_unlocked COMMAND emuscale_rtx --diagnostics --limit=60)
     add_test(NAME diagnostics_rejects_malformed_duration COMMAND emuscale_rtx --diagnostics --duration=60oops)
     add_test(NAME analyzer_rejects_missing_session COMMAND emuscale_analyze __missing_session__)
+    add_test(NAME diagnostics_rejects_bad_thresholds COMMAND emuscale_rtx --diagnostics --warning-ms=60 --spike-ms=50)
+    add_test(NAME diagnostics_rejects_nonfinite_threshold COMMAND emuscale_rtx --diagnostics --spike-ms=nan)
     set_tests_properties(diagnostics_B_requires_ready diagnostics_C_requires_ready
         diagnostics_B_rejects_disabled_optimizer diagnostics_A_requires_unlocked
-        diagnostics_rejects_malformed_duration analyzer_rejects_missing_session PROPERTIES WILL_FAIL TRUE)
+        diagnostics_rejects_malformed_duration analyzer_rejects_missing_session diagnostics_rejects_bad_thresholds
+        diagnostics_rejects_nonfinite_threshold PROPERTIES WILL_FAIL TRUE)
     # Tests use assert, including Release configurations.
-    foreach(test_target capability_tests pacing_tests diagnostic_tests)
+    foreach(test_target capability_tests pacing_tests diagnostic_tests timing_tests display_policy_tests processing_tests)
         if(MSVC)
             target_compile_options(${test_target} PRIVATE /UNDEBUG)
         else()

@@ -16,6 +16,7 @@
 #include <stdexcept>
 #include <thread>
 #include <vector>
+#include <future>
 
 namespace emuscale {
 namespace {
@@ -86,7 +87,10 @@ struct GpuUsage {
         return {app, game};
     }
 };
-const char* csv_header = "elapsed_s,sample_interval_s,callback_fps,distinct_capture_fps,presented_fps,callback_total,distinct_total,presented_total,average_source_ms,average_callback_ms,average_present_ms,one_percent_low_fps,pacing_stddev_ms,max_present_interval_ms,pacing_spikes_total,capture_to_present_return_ms,overwritten_total,repeated_timestamp_total,missing_timestamp_total,capped_total,capture_width,capture_height,preview_width,preview_height,fps_limit,vsync,sync_interval,tearing_requested,target_monitor,preview_monitor,target_refresh_hz,preview_refresh_hz,app_cpu_percent,eden_cpu_percent,app_working_set_mb,eden_working_set_mb,app_gpu_max_engine_percent,eden_gpu_max_engine_percent,previous_logging_work_ms,previous_write_flush_ms,events_dropped_total,target_minimized,callback_gap_s\n";
+const char* legacy_csv_header = "elapsed_s,sample_interval_s,callback_fps,distinct_capture_fps,presented_fps,callback_total,distinct_total,presented_total,average_source_ms,average_callback_ms,average_present_ms,one_percent_low_fps,pacing_stddev_ms,max_present_interval_ms,pacing_spikes_total,capture_to_present_return_ms,overwritten_total,repeated_timestamp_total,missing_timestamp_total,capped_total,capture_width,capture_height,preview_width,preview_height,fps_limit,vsync,sync_interval,tearing_requested,target_monitor,preview_monitor,target_refresh_hz,preview_refresh_hz,app_cpu_percent,eden_cpu_percent,app_working_set_mb,eden_working_set_mb,app_gpu_max_engine_percent,eden_gpu_max_engine_percent,previous_logging_work_ms,previous_write_flush_ms,events_dropped_total,target_minimized,callback_gap_s\n";
+const std::string csv_header = std::string(legacy_csv_header).substr(0, std::char_traits<char>::length(legacy_csv_header) - 1) +
+    ",present_calls_total,occluded_total,present_failed_total,repeated_present_total,duplicate_skipped_total,minimized_skipped_total,timestamp_order_errors,timing_records_dropped_total,warning_intervals_total,last_capture_qpc,last_source_timestamp_100ns,capture_min_ms,capture_max_ms,capture_p50_ms,capture_p95_ms,capture_p99_ms,present_min_ms,present_p50_ms,present_p95_ms,present_p99_ms,processing_cpu_ms,processing_gpu_ms,processing_gpu_sequence,processing_fallbacks_total,new_source_present_total,unknown_source_present_total,generated_total\n";
+const char* timing_header = "elapsed_s,stream,source_timestamp_100ns,interval_ms,qpc_ticks,warning_threshold_ms,spike_threshold_ms\n";
 std::vector<std::string> split(const std::string& line) {
     std::vector<std::string> result;
     std::istringstream s(line); std::string v;
@@ -103,6 +107,115 @@ void limit_utf8(std::string& value, std::size_t limit) {
     while (length && length < value.size() && (static_cast<unsigned char>(value[length]) & 0xC0) == 0x80) --length;
     value.resize(length);
 }
+std::string timing_report(const std::filesystem::path& directory) {
+    const auto path = directory / "timings.csv";
+    if (!std::filesystem::exists(path)) return "\nSession percentiles and marker correlation unavailable for this legacy session.\n";
+    if (std::filesystem::file_size(path) > 32 * 1024 * 1024) throw std::runtime_error("Timing data exceeds analysis bound");
+    std::ifstream file(path); std::string line; std::getline(file, line);
+    if (line + '\n' != timing_header) throw std::runtime_error("Invalid timing schema");
+    std::vector<double> capture, present;
+    std::vector<double> measurable_delays;
+    std::size_t invalid_clock_deltas = 0, missing_clock_sources = 0;
+    double qpc_frequency = 0, origin_qpc = 0;
+    const auto metadata_path = directory / "metadata.json";
+    if (std::filesystem::exists(metadata_path) && std::filesystem::file_size(metadata_path) <= 2 * 1024 * 1024) {
+        std::ifstream metadata_file(metadata_path); std::ostringstream metadata; metadata << metadata_file.rdbuf();
+        const auto text = metadata.str();
+        auto field = [&](const std::string& name) {
+            const auto key = '"' + name + "\":"; const auto start = text.find(key);
+            double n = 0;
+            if (start != std::string::npos) try { n = std::stod(text.substr(start + key.size())); } catch (...) {}
+            return std::isfinite(n) && n > 0 ? n : 0;
+        };
+        qpc_frequency = field("qpc_frequency"); origin_qpc = field("origin_qpc");
+    }
+    std::vector<FrameAnomaly> anomalies;
+    std::map<std::string, double> last_qpc, last_elapsed;
+    std::size_t invalid = 0, capture_warn = 0, capture_spike = 0, present_warn = 0, present_spike = 0;
+    double warning = 33.3, spike = 50, duration = 0;
+    while (std::getline(file, line)) {
+        if (line.size() > 512) { ++invalid; continue; }
+        const auto v = split(line);
+        try {
+            if (v.size() != 7 || (v[1] != "capture" && v[1] != "present")) throw std::runtime_error("Invalid timing row");
+            const double elapsed = number(v[0]), source = number(v[2]), ms = number(v[3]), timestamp = number(v[4]);
+            const double warn = number(v[5]), severe = number(v[6]);
+            if (elapsed < 0 || source < 0 || ms < 0 || timestamp <= 0 || warn <= 0 || severe < warn ||
+                timestamp < last_qpc[v[1]] || elapsed < last_elapsed[v[1]]) throw std::runtime_error("Invalid timing order or values");
+            if (std::floor(source) != source || std::floor(timestamp) != timestamp ||
+                (qpc_frequency && origin_qpc && std::abs((timestamp - origin_qpc) / qpc_frequency - elapsed) > .00001))
+                throw std::runtime_error("Inconsistent timing clock");
+            if ((!capture.empty() || !present.empty()) && (warning != warn || spike != severe)) throw std::runtime_error("Timing thresholds changed");
+            warning = warn; spike = severe; duration = std::max(duration, elapsed);
+            last_qpc[v[1]] = timestamp; last_elapsed[v[1]] = elapsed;
+            if (v[1] == "present") {
+                if (!source || !qpc_frequency) ++missing_clock_sources;
+                else {
+                    const double delay = 1000.0 * timestamp / qpc_frequency - source / 10'000.0;
+                    if (delay < 0 || delay >= 60000) ++invalid_clock_deltas;
+                    else measurable_delays.push_back(delay);
+                }
+            }
+            if (ms == 0) continue; // First frame has no preceding interval.
+            if (v[1] == "capture") { capture.push_back(ms); capture_warn += ms > warning; capture_spike += ms > spike; }
+            else { present.push_back(ms); present_warn += ms > warning; present_spike += ms > spike; }
+            if (ms > spike) anomalies.push_back({elapsed, ms, v[1]});
+        } catch (const std::exception&) { ++invalid; }
+    }
+    std::vector<ActivityMarker> markers;
+    const auto marker_path = directory / "markers.csv";
+    if (std::filesystem::exists(marker_path)) {
+        if (std::filesystem::file_size(marker_path) > 32 * 1024 * 1024) throw std::runtime_error("Marker data exceeds analysis bound");
+        std::ifstream marker_file(marker_path); std::getline(marker_file, line);
+        if (line != "elapsed_s,label") throw std::runtime_error("Invalid marker schema");
+        while (std::getline(marker_file, line)) {
+            const auto comma = line.find(',');
+            try {
+                if (comma == std::string::npos || line.size() > 1024) throw std::runtime_error("Invalid marker row");
+                const double elapsed = number(line.substr(0, comma));
+                if (elapsed < 0) throw std::runtime_error("Negative marker time");
+                markers.push_back({elapsed, line.substr(comma + 1)});
+            } catch (const std::exception&) { ++invalid; }
+        }
+    }
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(3) << "\nSession timing records: " << capture.size() << " capture intervals and "
+        << present.size() << " presentation intervals; " << invalid << " invalid timing/marker rows.\n\n"
+        << "| Stream | Mean ms | Min ms | Max ms | P50 ms | P95 ms | P99 ms | >" << warning << " ms | >" << spike << " ms |\n"
+        << "|---|---:|---:|---:|---:|---:|---:|---:|---:|\n";
+    auto row = [&](const char* name, const auto& values, auto warn, auto severe) {
+        const auto s = interval_statistics(values);
+        out << "| " << name << " | " << s.mean_ms << " | " << s.min_ms << " | " << s.max_ms << " | " << s.p50_ms
+            << " | " << s.p95_ms << " | " << s.p99_ms << " | " << warn << " | " << severe << " |\n";
+    };
+    row("Acquired capture arrival", capture, capture_warn, capture_spike); row("Accepted Present return", present, present_warn, present_spike);
+    out << "\nPercentiles use linear interpolation over all valid retained intervals, not percentiles of rolling averages. "
+        << "Capture arrivals/timestamps are not proof of visually unique game images. Simulation FPS is unsupported; generated frames remain zero. "
+        << "Raw coverage ends at " << duration << " s; check timing-record drops and quota events before treating this as complete-session coverage.\n\n";
+    const auto delay_stats = interval_statistics(measurable_delays);
+    out << "Clock-correlated compositor-to-Present-return samples: " << delay_stats.count << " valid, " << invalid_clock_deltas
+        << " negative/out-of-range deltas, " << missing_clock_sources << " missing source/clock samples. Valid-sample mean / P95: "
+        << delay_stats.mean_ms << " / " << delay_stats.p95_ms << " ms. This subset is an estimate; rejected deltas are unavailable, not zero latency. It does not measure physical scanout or input latency.\n\n";
+    if (delay_stats.count < .8 * (delay_stats.count + invalid_clock_deltas + missing_clock_sources))
+        out << "Insufficient valid clock correlations for a session-wide latency estimate. Treat rolling delay values as sparse diagnostic samples and investigate timestamp semantics before comparing latency.\n\n";
+    if (markers.empty()) out << "No activity markers were recorded; activity clustering cannot be evaluated.\n";
+    else {
+        out << "Marker correlation (within +/-2 seconds; capture and presentation anomalies are separate observations):\n\n"
+            << "| Marker | Occurrences | Nearby capture >" << spike << " ms | Nearby Present >" << spike << " ms |\n|---|---:|---:|---:|\n";
+        const auto correlated = correlate_markers(markers, anomalies);
+        // Keep auto-generated reports bounded even for arbitrary API marker labels.
+        std::size_t shown = 0;
+        for (const auto& c : correlated) {
+            if (shown++ >= 16) { out << "| Additional labels omitted | | | |\n"; break; }
+            auto label = c.label;
+            for (auto& ch : label) if (ch == '|' || ch == '\n' || ch == '\r') ch = ' ';
+            out << "| " << label.substr(0, 128) << " | " << c.markers << " | " << c.nearby_capture << " | " << c.nearby_present << " |\n";
+        }
+        out << "\nAn anomaly is counted once per label, but can correlate with several different labels. "
+            << "These sparse marker windows do not identify a root cause or establish statistical significance. Automatic window/health markers are sampled and may lag by one second.\n";
+    }
+    return out.str();
+}
 }
 
 struct DiagnosticSession::Impl {
@@ -112,9 +225,12 @@ struct DiagnosticSession::Impl {
     std::shared_ptr<DiagnosticRuntime> runtime;
     std::filesystem::path path;
     std::thread worker;
+    std::promise<void> initialized;
     std::mutex mutex;
     std::condition_variable wake;
-    std::deque<std::pair<std::string, std::string>> events;
+    struct Event { std::string kind, detail; std::int64_t qpc; };
+    std::deque<Event> events;
+    std::int64_t origin_qpc = 0, frequency = 0;
     std::atomic<bool> running{false}, failure{false};
     bool stopping = false;
     std::string reason = "session stopped";
@@ -125,29 +241,61 @@ struct DiagnosticSession::Impl {
     void record() noexcept {
         try {
             const auto origin = Clock::now();
-            auto previous_sample = origin, last_callback_seen = origin;
-            std::uint64_t previous_callbacks = 0;
+            auto previous_sample = origin;
             double previous_work = 0, previous_write = 0;
             std::ofstream csv(path / "metrics.csv", std::ios::binary), event_file(path / "events.jsonl", std::ios::binary);
-            if (!csv || !event_file) throw std::runtime_error("Cannot open diagnostic output");
+            std::ofstream timing_file(path / "timings.csv", std::ios::binary), marker_file(path / "markers.csv", std::ios::binary);
+            if (!csv || !event_file || !timing_file || !marker_file) throw std::runtime_error("Cannot open diagnostic output");
             csv << csv_header << std::fixed << std::setprecision(4);
+            timing_file << timing_header; marker_file << "elapsed_s,label\n";
+            csv.flush(); event_file.flush(); timing_file.flush(); marker_file.flush();
+            if (!csv || !event_file || !timing_file || !marker_file) throw std::runtime_error("Cannot initialize diagnostic files");
+            initialized.set_value();
             ProcessUsage app(GetCurrentProcessId()), eden(config.target_pid);
             app.sample(); eden.sample();
             GpuUsage gpu;
             auto displays = discover_displays(false);
             std::string old_displays, old_configuration;
-            std::uintmax_t written = std::filesystem::file_size(path / "metadata.json") + std::char_traits<char>::length(csv_header);
-            auto write_event = [&](const std::string& kind, const std::string& detail) {
+            std::uintmax_t written = std::filesystem::file_size(path / "metadata.json") + csv_header.size() + std::char_traits<char>::length(timing_header) + 16;
+            bool quota_reached = false;
+            auto write_event = [&](const std::string& kind, const std::string& detail, std::int64_t timestamp = 0) {
+                if (!timestamp) timestamp = qpc().first;
+                const auto elapsed = double(timestamp - origin_qpc) / frequency;
                 std::string line = "{\"utc\":" + json_string(utc()) + ",\"elapsed_s\":" +
-                    std::to_string(std::chrono::duration<double>(Clock::now() - origin).count()) +
+                    std::to_string(elapsed) + ",\"qpc_ticks\":" + std::to_string(timestamp) +
                     ",\"kind\":" + json_string(kind) + ",\"detail\":" + json_string(detail) + "}\n";
                 event_file << line; written += line.size();
+                if (kind == "activity" || kind == "automatic_marker" || kind == "fps_limit" || kind == "vsync") {
+                    auto label = detail;
+                    if (kind == "fps_limit") label = "FPS limit: " + label;
+                    if (kind == "vsync") label = "VSync: " + label;
+                    for (auto& c : label) if (c == ',' || c == '\n' || c == '\r') c = ' ';
+                    const auto marker = std::to_string(elapsed) + ',' + label + '\n';
+                    marker_file << marker; written += marker.size();
+                }
             };
-            write_event("recording_started", "Declared game label; no game-memory inspection. Visually changed FPS unavailable.");
+            auto write_timings = [&] {
+                for (const auto& r : metrics->drain_timings()) {
+                    if (r.qpc < origin_qpc) continue;
+                    std::ostringstream line;
+                    line << std::fixed << std::setprecision(6) << double(r.qpc - origin_qpc) / frequency << ','
+                        << (r.presentation ? "present" : "capture") << ',' << r.source_timestamp_100ns << ',' << r.interval_ms << ','
+                        << r.qpc << ',' << config.warning_threshold_ms << ',' << config.spike_threshold_ms << '\n';
+                    const auto text = line.str();
+                    if (written + text.size() + 16384 >= config.session_limit_bytes) { quota_reached = true; break; }
+                    timing_file << text; written += text.size();
+                }
+            };
+            write_event("recording_started", "Declared game label; no game-memory inspection. Visually changed FPS unavailable.", origin_qpc);
             auto next = origin + std::chrono::seconds(1);
             unsigned sample_index = 0;
+            unsigned old_topology = runtime->topology_generation.load();
+            CaptureCondition old_condition = CaptureCondition::waiting;
+            RECT previous_target{}, previous_preview{};
+            GetWindowRect(config.target, &previous_target); GetWindowRect(config.preview, &previous_preview);
+            std::wstring old_target_monitor, old_preview_monitor;
             while (true) {
-                std::deque<std::pair<std::string, std::string>> pending;
+                std::deque<Event> pending;
                 bool done;
                 {
                     std::unique_lock lock(mutex);
@@ -156,29 +304,47 @@ struct DiagnosticSession::Impl {
                 }
                 const auto begin = Clock::now();
                 for (const auto& e : pending) {
-                    if (written + 8192 >= config.session_limit_bytes) break;
-                    write_event(e.first, e.second);
+                    if (written + 16384 >= config.session_limit_bytes) { quota_reached = true; break; }
+                    write_event(e.kind, e.detail, e.qpc);
                 }
                 if (done && begin - previous_sample < std::chrono::milliseconds(10)) {
-                    write_event("session_end", reason + "; events_dropped=" + std::to_string(lost.load()));
+                    write_timings();
+                    write_event("session_end", (quota_reached ? "storage quota reached; timing coverage truncated; " : "") + reason + "; events_dropped=" + std::to_string(lost.load()));
                     break;
                 }
-                if (written + 8192 >= config.session_limit_bytes) {
+                if (quota_reached || written + 16384 >= config.session_limit_bytes) {
                     write_event("session_end", "storage quota reached; capture continues without logging");
                     break;
                 }
-                if (!done && begin < next) { event_file.flush(); continue; }
+                if (!done && begin < next) { event_file.flush(); marker_file.flush(); continue; }
                 const auto [now, frequency] = qpc();
                 const auto m = metrics->snapshot(now, frequency);
-                const double elapsed = std::chrono::duration<double>(begin - origin).count();
+                const double elapsed = double(now - origin_qpc) / frequency;
                 const double interval = std::chrono::duration<double>(begin - previous_sample).count();
                 previous_sample = begin;
-                if (m.callback_total != previous_callbacks) last_callback_seen = begin;
-                previous_callbacks = m.callback_total;
-                if (sample_index++ % 5 == 0) displays = discover_displays(false);
+                const unsigned topology = runtime->topology_generation.load();
+                if (sample_index++ % 5 == 0 || topology != old_topology) displays = discover_displays(false);
+                old_topology = topology;
                 const auto inventory = displays_json(displays);
                 if (inventory != old_displays) { write_event("displays", inventory); old_displays = inventory; }
                 const auto target_monitor = window_display(config.target), preview_monitor = window_display(config.preview);
+                if (!old_target_monitor.empty() && (target_monitor != old_target_monitor || preview_monitor != old_preview_monitor))
+                    write_event("automatic_marker", "Monitor switching");
+                old_target_monitor = target_monitor; old_preview_monitor = preview_monitor;
+                RECT target_rect{}, preview_rect{};
+                if (GetWindowRect(config.target, &target_rect) && !EqualRect(&target_rect, &previous_target)) write_event("automatic_marker", "Target window movement");
+                if (GetWindowRect(config.preview, &preview_rect) && !EqualRect(&preview_rect, &previous_preview)) write_event("automatic_marker", "Preview window movement or resize");
+                previous_target = target_rect; previous_preview = preview_rect;
+                DWORD current_pid = 0; GetWindowThreadProcessId(config.target, &current_pid);
+                const double capture_gap = m.last_capture_qpc ? std::max(0.0, double(now - m.last_capture_qpc) / frequency) : elapsed;
+                const auto condition = capture_condition(elapsed, capture_gap, m.last_capture_qpc != 0,
+                    IsIconic(config.target) != FALSE, current_pid == config.target_pid, IsWindow(config.target) != FALSE);
+                if (condition != old_condition) {
+                    write_event("capture_health", condition_name(condition));
+                    if (condition == CaptureCondition::stalled) write_event("automatic_marker", "Capture interruption");
+                    if (condition == CaptureCondition::active && old_condition != CaptureCondition::waiting) write_event("automatic_marker", "Capture recovery");
+                    old_condition = condition;
+                }
                 double target_hz = 0, preview_hz = 0;
                 for (const auto& d : displays) {
                     if (d.device == target_monitor) target_hz = d.refresh_hz;
@@ -207,23 +373,33 @@ struct DiagnosticSession::Impl {
                     << utf8(target_monitor) << ',' << utf8(preview_monitor) << ',' << target_hz << ',' << preview_hz << ','
                     << app_cpu << ',' << eden_cpu << ',' << app_mb << ',' << eden_mb << ',' << app_gpu << ',' << eden_gpu << ','
                     << previous_work << ',' << previous_write << ',' << lost.load() << ',' << (IsIconic(config.target) ? 1 : 0) << ','
-                    << std::chrono::duration<double>(begin - last_callback_seen).count() << '\n';
+                    << (m.last_callback_qpc ? std::max(0.0, double(now - m.last_callback_qpc) / frequency) : elapsed) << ',' << m.present_calls_total << ',' << m.occluded_total << ',' << m.present_failed_total << ','
+                    << m.repeated_present_total << ',' << m.duplicate_skipped_total << ',' << m.minimized_skipped_total << ','
+                    << m.timestamp_order_errors << ',' << m.timing_records_dropped_total << ',' << m.warning_intervals_total << ','
+                    << m.last_capture_qpc << ',' << m.last_source_timestamp_100ns << ',' << m.capture_intervals.min_ms << ',' << m.capture_intervals.max_ms << ','
+                    << m.capture_intervals.p50_ms << ',' << m.capture_intervals.p95_ms << ',' << m.capture_intervals.p99_ms << ','
+                    << m.presentation_intervals.min_ms << ',' << m.presentation_intervals.p50_ms << ',' << m.presentation_intervals.p95_ms << ',' << m.presentation_intervals.p99_ms << ','
+                    << runtime->processing_cpu_ms.load() << ',' << runtime->processing_gpu_ms.load() << ',' << runtime->processing_gpu_sequence.load() << ',' << runtime->processing_fallbacks.load() << ','
+                    << m.new_source_present_total << ',' << m.unknown_source_present_total << ',' << m.generated_total << '\n';
                 const auto write_begin = Clock::now();
                 const auto line = row.str(); csv << line; written += line.size();
-                csv.flush(); event_file.flush();
-                if (!csv || !event_file) throw std::runtime_error("Diagnostic write/flush failed");
+                write_timings();
+                csv.flush(); event_file.flush(); timing_file.flush(); marker_file.flush();
+                if (!csv || !event_file || !timing_file || !marker_file) throw std::runtime_error("Diagnostic write/flush failed");
                 previous_write = std::chrono::duration<double, std::milli>(Clock::now() - write_begin).count();
                 previous_work = std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
-                if (done) { write_event("session_end", reason + "; events_dropped=" + std::to_string(lost.load())); break; }
+                if (done) { write_event("session_end", (quota_reached ? "storage quota reached; timing coverage truncated; " : "") + reason + "; events_dropped=" + std::to_string(lost.load())); break; }
                 next += std::chrono::seconds(1);
                 if (next < Clock::now()) next = Clock::now() + std::chrono::seconds(1);
             }
             csv.flush(); event_file.flush();
-            if (!csv || !event_file) throw std::runtime_error("Diagnostic final flush failed");
-            csv.close(); event_file.close();
+            timing_file.flush(); marker_file.flush();
+            if (!csv || !event_file || !timing_file || !marker_file) throw std::runtime_error("Diagnostic final flush failed");
+            csv.close(); event_file.close(); timing_file.close(); marker_file.close();
             analyze_session(path);
         } catch (const std::exception& e) {
             failure = true;
+            try { initialized.set_exception(std::current_exception()); } catch (const std::future_error&) {}
             // No repeated retries or unbounded error output if storage fails.
             OutputDebugStringA((std::string("EmuScale diagnostics: ") + e.what()).c_str());
         }
@@ -236,6 +412,9 @@ void DiagnosticSession::start(const std::filesystem::path& root, DiagnosticConfi
     std::shared_ptr<FrameMetrics> metrics, std::shared_ptr<CaptureStats> stats,
     std::shared_ptr<DiagnosticRuntime> runtime) {
     if (impl_->worker.joinable()) throw std::logic_error("Diagnostic session already started");
+    if (!metrics || !stats || !runtime) throw std::invalid_argument("Diagnostic shared state is null");
+    metrics->set_thresholds(config.warning_threshold_ms, config.spike_threshold_ms);
+    const auto [origin_qpc, frequency] = qpc(); impl_->origin_qpc = origin_qpc; impl_->frequency = frequency;
     std::filesystem::create_directories(root);
     // Exclusive file handle coordinates storage accounting between processes; never deletes old logs.
     impl_->storage_lock = CreateFileW((root / ".recorder.lock").c_str(), GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_HIDDEN, nullptr);
@@ -252,7 +431,8 @@ void DiagnosticSession::start(const std::filesystem::path& root, DiagnosticConfi
     if (!std::filesystem::create_directory(impl_->path)) throw std::runtime_error("Diagnostic directory already exists");
     std::ofstream metadata(impl_->path / "metadata.json", std::ios::binary);
     const auto initial_displays = discover_displays();
-    metadata << "{\n\"schema_version\":1,\"app_version\":\"0.1.2\",\"started_utc\":" << json_string(utc())
+    metadata << "{\n\"schema_version\":2,\"app_version\":\"0.1.3\",\"started_utc\":" << json_string(utc())
+        << ",\"origin_qpc\":" << origin_qpc << ",\"qpc_frequency\":" << frequency
         << ",\"game_label\":" << json_string(config.game) << ",\"game_label_source\":\"user declaration\""
         << ",\"scenario\":" << json_string(config.scenario) << ",\"optimizer\":" << json_string(config.optimizer)
         << ",\"scene\":" << json_string(config.scene) << ",\"configuration_ready\":" << (config.ready ? "true" : "false")
@@ -265,7 +445,8 @@ void DiagnosticSession::start(const std::filesystem::path& root, DiagnosticConfi
         << ",\"delay_definition\":\"WGC compositor timestamp to DXGI Present return; not input latency\""
         << ",\"gpu_metric\":\"PDH maximum engine utilization per process across adapters; -1 unavailable\""
         << ",\"cpu_metric\":\"process CPU percent normalized over all logical processors; -1 unavailable\""
-        << ",\"spike_threshold_ms\":50,\"session_limit_bytes\":" << config.session_limit_bytes
+        << ",\"simulation_fps\":null,\"generated_fps\":0,\"warning_threshold_ms\":" << config.warning_threshold_ms
+        << ",\"spike_threshold_ms\":" << config.spike_threshold_ms << ",\"session_limit_bytes\":" << config.session_limit_bytes
         << ",\"storage_limit_bytes\":" << config.storage_limit_bytes
         << ",\"active_monitor_count\":" << initial_displays.size()
         << ",\"displays\":" << displays_json(initial_displays) << "\n}\n";
@@ -273,14 +454,16 @@ void DiagnosticSession::start(const std::filesystem::path& root, DiagnosticConfi
     if (!metadata) throw std::runtime_error("Cannot write diagnostic metadata");
     impl_->config = std::move(config); impl_->metrics = std::move(metrics); impl_->stats = std::move(stats); impl_->runtime = std::move(runtime);
     impl_->running = true;
+    auto initialized = impl_->initialized.get_future();
     impl_->worker = std::thread([this] { impl_->record(); });
+    try { initialized.get(); } catch (...) { stop("recorder initialization failed"); throw; }
 }
 void DiagnosticSession::event(std::string kind, std::string detail) {
     if (!impl_->running) return;
     std::lock_guard lock(impl_->mutex);
     if (impl_->events.size() >= 128) { ++impl_->lost; return; }
     limit_utf8(kind, 64); limit_utf8(detail, 512);
-    impl_->events.emplace_back(std::move(kind), std::move(detail)); impl_->wake.notify_one();
+    impl_->events.push_back({std::move(kind), std::move(detail), qpc().first}); impl_->wake.notify_one();
 }
 void DiagnosticSession::stop(std::string reason) {
     if (!impl_->worker.joinable()) return;
@@ -299,7 +482,7 @@ std::string analyze_session(const std::filesystem::path& directory, bool write_s
     std::ifstream file(path);
     std::string line;
     std::getline(file, line);
-    if (line + '\n' != csv_header) throw std::runtime_error("Unsupported diagnostic CSV schema");
+    if (line + '\n' != csv_header && line + '\n' != legacy_csv_header) throw std::runtime_error("Unsupported diagnostic CSV schema");
     const auto keys = split(line);
     std::map<std::string, std::size_t> index;
     for (std::size_t i = 0; i < keys.size(); ++i) index[keys[i]] = i;
@@ -309,6 +492,8 @@ std::string analyze_session(const std::filesystem::path& directory, bool write_s
     double max_delay = -1, last_overwrites = 0, last_repeats = 0, last_spikes = 0, last_lost = 0, max_cpu = -1;
     double weighted_cpu = 0, cpu_seconds = 0, total_work = 0;
     std::string last_configuration;
+    struct SettingSamples { std::size_t count = 0; double source = 0, present = 0; };
+    std::map<std::string, SettingSamples> setting_samples;
     std::size_t changes = 0;
     while (std::getline(file, line)) {
         if (line.size() > 8192) throw std::runtime_error("Oversized metrics row");
@@ -320,7 +505,7 @@ std::string analyze_session(const std::filesystem::path& directory, bool write_s
             for (std::size_t i = 0; i < fields.size(); ++i) {
                 if (keys[i] == "fps_limit" || keys[i] == "vsync" || keys[i] == "target_monitor" || keys[i] == "preview_monitor") continue;
                 const double n = number(fields[i]);
-                const bool optional = keys[i].find("cpu_percent") != std::string::npos || keys[i].find("working_set") != std::string::npos || keys[i].find("gpu_max") != std::string::npos || keys[i] == "capture_to_present_return_ms";
+                const bool optional = keys[i].find("cpu_percent") != std::string::npos || keys[i].find("working_set") != std::string::npos || keys[i].find("gpu_max") != std::string::npos || keys[i] == "capture_to_present_return_ms" || keys[i] == "processing_gpu_ms";
                 if (n < 0 && !(optional && n == -1)) throw std::runtime_error("Negative metric");
                 if (keys[i].ends_with("_total") && std::floor(n) != n) throw std::runtime_error("Non-integral cumulative counter");
                 if ((keys[i].find("cpu_percent") != std::string::npos || keys[i].find("gpu_max") != std::string::npos) && n > 100.01)
@@ -330,11 +515,13 @@ std::string analyze_session(const std::filesystem::path& directory, bool write_s
             bool known_limit = false;
             for (int n = 0; n <= 8; ++n) if (fields[index["fps_limit"]] == utf8(fps_limit_name(static_cast<FpsLimit>(n)))) known_limit = true;
             if (!known_limit) throw std::runtime_error("Invalid FPS limit");
+            if (index.contains("present_calls_total") && (v("presented_total") + v("occluded_total") + v("present_failed_total") > v("present_calls_total") || v("repeated_present_total") > v("presented_total"))) throw std::runtime_error("Inconsistent presentation accounting");
             if (v("distinct_total") + v("repeated_timestamp_total") + v("missing_timestamp_total") > v("callback_total")) throw std::runtime_error("Frame totals exceed callbacks");
             if (v("elapsed_s") <= last_elapsed || v("sample_interval_s") <= 0) throw std::runtime_error("Non-monotonic sample time");
-            for (const auto* key : {"callback_total", "distinct_total", "presented_total", "overwritten_total", "repeated_timestamp_total", "missing_timestamp_total", "pacing_spikes_total", "events_dropped_total", "capped_total"})
+            for (const auto& key : keys) if (key.ends_with("_total") || key == "timestamp_order_errors")
                 if (previous.contains(key) && v(key) < previous[key]) throw std::runtime_error("Counter regressed");
-            for (const auto* key : {"callback_total", "distinct_total", "presented_total", "overwritten_total", "repeated_timestamp_total", "missing_timestamp_total", "pacing_spikes_total", "events_dropped_total", "capped_total"}) previous[key] = v(key);
+            if (index.contains("new_source_present_total") && v("new_source_present_total") + v("repeated_present_total") + v("unknown_source_present_total") != v("presented_total")) throw std::runtime_error("Inconsistent source presentation classification");
+            for (const auto& key : keys) if (key.ends_with("_total") || key == "timestamp_order_errors") previous[key] = v(key);
             last_elapsed = v("elapsed_s"); ++count;
             // A final sub-second row preserves counters but would distort a rate
             // mean and amplify coarse GetProcessTimes rounding during teardown.
@@ -343,6 +530,10 @@ std::string analyze_session(const std::filesystem::path& directory, bool write_s
                 callback += v("callback_fps"); distinct += v("distinct_capture_fps"); presented += v("presented_fps");
                 max_cpu = std::max(max_cpu, v("app_cpu_percent"));
                 if (v("app_cpu_percent") >= 0) { weighted_cpu += v("app_cpu_percent") * v("sample_interval_s"); cpu_seconds += v("sample_interval_s"); }
+                const auto label = fields[index["fps_limit"]] + " / " + fields[index["vsync"]] + " / " + fields[index["preview_width"]] + "x" + fields[index["preview_height"]];
+                if (setting_samples.size() < 64 || setting_samples.contains(label)) {
+                    auto& group = setting_samples[label]; ++group.count; group.source += v("distinct_capture_fps"); group.present += v("presented_fps");
+                }
             } else ++partial;
             if (v("callback_fps") == 0) ++interruptions;
             if (v("sample_interval_s") > 1.5) ++gaps;
@@ -378,7 +569,7 @@ std::string analyze_session(const std::filesystem::path& directory, bool write_s
         out << "Recorded duration: " << last_elapsed << " s. Mean one-second callback / timestamp-distinct / presented FPS: "
             << (stable ? callback / stable : 0) << " / " << (stable ? distinct / stable : 0) << " / " << (stable ? presented / stable : 0)
             << ". Rate/CPU summaries exclude " << partial << " final/short intervals under 0.5 s. These are capture/Present measurements, not internal game FPS.\n\n"
-            << "Confirmed observations:\n\n- Presentation intervals over 50 ms: " << last_spikes << "; largest observed interval: " << max_interval << " ms.\n"
+            << "Confirmed observations:\n\n- Presentation intervals over configured spike threshold (legacy: 50 ms): " << last_spikes << "; largest observed interval: " << max_interval << " ms.\n"
             << "- Application mailbox overwrites: " << last_overwrites << "; repeated WGC timestamps: " << last_repeats << ".\n"
             << "- Samples with no capture callbacks: " << interruptions << "; sampling intervals over 1.5 s: " << gaps << "; minimized-target samples: " << minimized << ".\n"
             << "- Presentation below 85% of distinct capture FPS: " << mismatch << " samples; numeric cap active: " << capped << " samples.\n"
@@ -392,13 +583,33 @@ std::string analyze_session(const std::filesystem::path& directory, bool write_s
         if (changes) out << "- Split comparisons at configuration events; do not compare mixed settings as a single benchmark.\n";
         if (interruptions || gaps) out << "- Correlate interruptions with activity, minimized state, target closure and capture-error events; a source stall or scheduling delay is possible.\n";
         if (mismatch) out << "- Inspect numeric caps, VSync/monitor refresh and mailbox overwrites before attributing the presentation shortfall to GPU cost.\n";
-        if (last_spikes) out << "- Correlate >50 ms intervals with loading, travel or stutter markers; fixed-threshold spikes alone do not establish a renderer fault.\n";
+        if (last_spikes) out << "- Correlate intervals over the spike threshold with loading, travel or stutter markers; threshold crossings alone do not establish a renderer fault.\n";
         if (max_work > 10 || max_write > 10) out << "- Investigate diagnostic sampling or disk work exceeding 10 ms on the worker.\n";
         else out << "- Observed logging work stayed below 10 ms per sampled cycle. An A/B run with diagnostics disabled is needed to attribute gameplay overhead.\n";
         if (!mismatch && !interruptions) out << "- Capture and presentation tracked in the sampled windows; repeat a matched 60-120 s scene before changing the capture pipeline.\n";
     } else out << "No valid performance samples; collect a session lasting at least one second.\n\n";
     if (quota) out << "\nLogging stopped at its storage quota; capture may have continued. Archive logs before the next recording.\n";
+    if (setting_samples.size() > 1) {
+        out << "\nSample groups by presentation settings (rolling FPS windows can overlap a transition):\n\n"
+            << "| Limit / VSync / Preview pixels | Samples | Distinct capture FPS | Present FPS |\n|---|---:|---:|---:|\n";
+        std::size_t shown = 0;
+        for (const auto& [label, group] : setting_samples) {
+            if (shown++ >= 16) { out << "| Additional groups omitted | | | |\n"; break; }
+            out << "| " << label << " | " << group.count << " | " << group.source / group.count << " | " << group.present / group.count << " |\n";
+        }
+    }
     out << "\nVisually changed FPS and pixel duplicates are unavailable. Distinct timestamps cannot prove image changes. GPU values are maximum per-process engine counters, not total device utilization; -1 means unavailable. Logging work is reported one cycle late; the final cycle is excluded. No causal logging-overhead conclusion is possible without a matched control run.\n";
+    if (index.contains("present_calls_total")) {
+        out << "\nPresentation accounting: " << previous["present_calls_total"] << " calls, " << previous["presented_total"] << " accepted, "
+            << previous["new_source_present_total"] << " new source timestamps, " << previous["repeated_present_total"] << " repeated/stale source timestamps, "
+            << previous["unknown_source_present_total"] << " unknown source timestamps; generated " << previous["generated_total"] << ". "
+            << "Occluded / failed calls: " << previous["occluded_total"] << " / " << previous["present_failed_total"] << ". "
+            << "Duplicate/stale / minimized skips: " << previous["duplicate_skipped_total"] << " / " << previous["minimized_skipped_total"] << ". "
+            << "Timing-record drops / timestamp-order rejections: " << previous["timing_records_dropped_total"] << " / " << previous["timestamp_order_errors"] << ". "
+            << "Processing fallbacks: " << previous["processing_fallbacks_total"] << ". "
+            << "Accepted Present returns do not prove physical scanout. Repeated presents never count as generated game frames.\n";
+    }
+    out << timing_report(directory);
     if (write_summary) {
         std::ofstream summary(directory / "summary.md", std::ios::binary); summary << out.str(); summary.flush();
         if (!summary) throw std::runtime_error("Cannot write diagnostic summary");

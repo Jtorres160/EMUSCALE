@@ -26,6 +26,16 @@ int main() {
     assert(pacer.allow(1'035'000, frequency));
     pacer.set_limit(FpsLimit::unlocked);
     assert(pacer.allow(1'035'001, frequency));
+    for (auto mode : {FpsLimit::fps30, FpsLimit::fps60, FpsLimit::automatic, FpsLimit::unlocked}) {
+        pacer.set_limit(mode);
+        int accepted = 0;
+        for (int i = 0; i < 30; ++i) accepted += pacer.allow(2'000'000 + i * 33'334, frequency);
+        assert(accepted == 30); // 60/Auto/Unlocked cannot invent more source frames.
+    }
+    pacer.set_limit(FpsLimit::fps60);
+    assert(pacer.allow(4'000'000, frequency));
+    assert(!pacer.allow(4'008'000, frequency));
+    assert(pacer.allow(4'017'000, frequency));
 
     FrameMetrics metrics;
     metrics.on_callback(1'000'000, frequency);

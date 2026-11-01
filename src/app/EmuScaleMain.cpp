@@ -24,16 +24,19 @@
 #include <string>
 #include <string_view>
 #include <chrono>
+#include <cmath>
 
 namespace {
 constexpr UINT marker_message = WM_APP + 10;
+constexpr UINT set_limit_message = WM_APP + 11, set_vsync_message = WM_APP + 12, preview_size_message = WM_APP + 13;
 constexpr const char* markers[] = {"Normal exploration", "Combat", "Fast travel", "Menu opened",
-    "Loading screen", "Heavy visual effects", "Stuttering observed"};
+    "Loading screen", "Heavy visual effects", "Stuttering observed", "Camera movement", "Window movement", "Monitor switching", "Capture interruption"};
 struct Options {
     bool diagnostics = false, ready = false, list = false, display_info = false;
     std::string scenario = "A", optimizer = "disabled", scene = "unspecified";
     std::uintptr_t hwnd = 0;
     int duration = 0;
+    double warning_ms = 33.3, spike_ms = 50;
     emuscale::FpsLimit limit = emuscale::FpsLimit::unlocked;
     emuscale::VSyncMode vsync = emuscale::VSyncMode::automatic;
 };
@@ -51,6 +54,12 @@ Options options(int argc, wchar_t** argv) {
         else if (arg.starts_with(L"--scene=")) out.scene = emuscale::utf8(arg.substr(8));
         else if (arg.starts_with(L"--target-hwnd=")) { std::size_t end = 0; const auto value = arg.substr(14); out.hwnd = std::stoull(value, &end, 0); if (end != value.size() || !out.hwnd) throw std::runtime_error("Invalid HWND"); }
         else if (arg.starts_with(L"--duration=")) { std::size_t end = 0; const auto value = arg.substr(11); out.duration = std::stoi(value, &end); if (end != value.size()) throw std::runtime_error("Invalid duration"); }
+        else if (arg.starts_with(L"--warning-ms=") || arg.starts_with(L"--spike-ms=")) {
+            const bool warning = arg.starts_with(L"--warning-ms="); const auto value = arg.substr(warning ? 13 : 11);
+            std::size_t end = 0; const double parsed = std::stod(value, &end);
+            if (end != value.size() || !std::isfinite(parsed) || parsed <= 0 || parsed > 10000) throw std::runtime_error("Threshold must be finite and in (0,10000] ms");
+            if (warning) out.warning_ms = parsed; else out.spike_ms = parsed;
+        }
         else if (arg.starts_with(L"--limit=")) {
             bool found = false;
             for (int n = 0; n <= 8; ++n) if (arg.substr(8) == emuscale::fps_limit_name(static_cast<emuscale::FpsLimit>(n)) ||
@@ -68,8 +77,9 @@ Options options(int argc, wchar_t** argv) {
     }
     if (out.duration != 0 && out.duration != 30 && out.duration != 60 && out.duration != 120)
         throw std::runtime_error("Duration must be 0 (continuous), 30, 60, or 120 seconds");
-    if (out.scenario != "A" && out.scenario != "B" && out.scenario != "C") throw std::runtime_error("Scenario must be A, B, or C");
-    if (out.diagnostics && out.scenario != "A" && (!out.ready || !optimizer_declared || out.optimizer.empty() || out.scene == "unspecified"))
+    if (out.spike_ms < out.warning_ms) throw std::runtime_error("Spike threshold must be >= warning threshold");
+    if (out.scenario != "A" && out.scenario != "B" && out.scenario != "C" && out.scenario != "D") throw std::runtime_error("Scenario must be A, B, C, or D (validation)");
+    if (out.diagnostics && (out.scenario == "B" || out.scenario == "C") && (!out.ready || !optimizer_declared || out.optimizer.empty() || out.scene == "unspecified"))
         throw std::runtime_error("Tests B/C require --ready, an explicit --optimizer=configuration and --scene=label");
     if (out.diagnostics && out.scenario == "B" && out.optimizer == "disabled") throw std::runtime_error("Test B requires a declared working optimizer configuration");
     if (out.diagnostics && out.scenario == "A" && (out.optimizer != "disabled" || out.limit != emuscale::FpsLimit::unlocked))
@@ -94,6 +104,7 @@ void write_console(std::wstring_view value) {
 
 struct AppState {
     HWND target = nullptr;
+    DWORD target_pid = 0;
     HWND preview = nullptr;
     HWND controls = nullptr;
     HWND metrics_text = nullptr;
@@ -113,6 +124,9 @@ struct AppState {
     int monitor_refresh_hz = 0;
     std::wstring status = L"Starting";
     std::wstring error;
+    bool recovery_pending = false;
+    unsigned recovery_attempts = 0;
+    std::chrono::steady_clock::time_point retry_after, recovered_at;
 };
 
 std::pair<std::int64_t, std::int64_t> qpc() {
@@ -171,17 +185,21 @@ std::wstring hresult_text(long code) {
 void show_frame(AppState& app) {
     auto frame = app.capture.take_frame();
     if (!frame) return;
+    struct FrameLease {
+        decltype(frame)& value;
+        ~FrameLease() { if (value) try { value->Close(); } catch (...) {} }
+    } lease{frame};
     const auto size = frame->ContentSize();
-    if (size.Width <= 0 || size.Height <= 0) { frame->Close(); return; }
+    if (size.Width <= 0 || size.Height <= 0) return;
     const auto source_ticks = frame->SystemRelativeTime().count();
-    if (source_ticks != 0 && source_ticks == app.last_presented_source_ticks) {
-        frame->Close();
+    if (source_ticks > 0 && source_ticks <= app.last_presented_source_ticks) {
+        app.metrics->on_skipped(false);
         return;
     }
+    if (IsIconic(app.preview)) { app.metrics->on_skipped(true); return; }
     const auto [now, frequency] = qpc();
     if (!app.pacer.allow(now, frequency)) {
         app.metrics->on_capped();
-        frame->Close();
         return;
     }
     auto access = frame->Surface().as<
@@ -190,14 +208,22 @@ void show_frame(AppState& app) {
     winrt::check_hresult(access->GetInterface(IID_PPV_ARGS(&texture)));
     D3D11_TEXTURE2D_DESC desc{};
     texture->GetDesc(&desc);
-    const bool presented = app.renderer.present(texture.Get(), static_cast<UINT>(size.Width),
-                         static_cast<UINT>(size.Height));
+    auto result = app.renderer.present(texture.Get(), static_cast<UINT>(size.Width), static_cast<UINT>(size.Height), source_ticks);
     const auto [presented_at, present_frequency] = qpc();
-    if (presented) {
+    if (result.called) app.metrics->on_present_result(presented_at, present_frequency, source_ticks,
+        result.status == S_OK, result.status == DXGI_STATUS_OCCLUDED, FAILED(result.status));
+    app.diagnostic_runtime->processing_cpu_ms = result.processing.submit_cpu_ms;
+    app.diagnostic_runtime->processing_gpu_ms = result.processing.last_completed_gpu_ms;
+    app.diagnostic_runtime->processing_gpu_sequence = result.processing.gpu_timing_sequence;
+    if (result.processing.fallback) { ++app.diagnostic_runtime->processing_fallbacks; app.diagnostics.event("processing_fallback", result.processing.reason); }
+    winrt::check_hresult(result.status);
+    if (result.called && result.status == S_OK) {
         app.stats->presented.fetch_add(1, std::memory_order_relaxed);
-        app.metrics->on_present(presented_at, present_frequency, source_ticks);
+        app.last_presented_source_ticks = source_ticks;
     }
-    app.last_presented_source_ticks = source_ticks;
+    // The processing result may reference the borrowed WGC texture. Release all
+    // references before returning the frame lease to its pool.
+    result.processing.output.texture.Reset();
     texture.Reset();
     frame->Close();
     frame.reset();
@@ -219,7 +245,7 @@ void update_title(AppState& app) {
     const int cap = emuscale::fps_cap(app.pacer.limit());
     const int target = cap ? cap : app.pacer.limit() == emuscale::FpsLimit::automatic ?
         app.monitor_refresh_hz : 0;
-    std::wstring title = L"EmuScale RTX v0.1.2 | " + app.status + L" | " +
+    std::wstring title = L"EmuScale RTX v0.1.3 | " + app.status + L" | " +
         app.renderer.gpu_name() + L" | source timestamps " +
         std::to_wstring(static_cast<int>(measured.distinct_capture_fps)) + L" FPS | present " +
         std::to_wstring(static_cast<int>(measured.presented_fps)) + L" FPS | target " +
@@ -262,7 +288,7 @@ void update_title(AppState& app) {
               << L"Diagnostic: " << diagnose(measured, cap, target, dropped)
               << L"\r\nEden: " << emuscale::window_display(app.target) << L" | Preview: " << emuscale::window_display(app.preview)
               << L"\r\nRecorder: " << (app.diagnostics.failed() ? L"ERROR (see console)" : app.diagnostics.active() ? L"recording" : L"inactive/quota")
-              << L" | spikes >50 ms: " << measured.pacing_spikes_total;
+              << L" | spikes (configured): " << measured.pacing_spikes_total;
         SetWindowTextW(app.metrics_text, lines.str().c_str());
     }
     if (app.benchmark.active()) {
@@ -285,6 +311,19 @@ constexpr int duration_combo_id = 2003;
 constexpr int benchmark_start_id = 2004;
 constexpr int benchmark_stop_id = 2005;
 constexpr int controls_hide_id = 2006;
+
+void request_capture_recovery(AppState& app) {
+    if (app.recovery_pending) return;
+    const auto hr = app.stats->capture_hresult.load();
+    app.diagnostics.event("capture_error", emuscale::utf8(hresult_text(hr)));
+    const auto delay = emuscale::capture_retry_delay(app.recovery_attempts, hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET);
+    if (!delay)
+        throw std::runtime_error("Capture recovery exhausted or D3D device lost; restart EmuScale");
+    app.capture.stop();
+    app.recovery_pending = true;
+    app.retry_after = std::chrono::steady_clock::now() + std::chrono::seconds(delay);
+    app.status = L"Capture interrupted; waiting to retry";
+}
 
 LRESULT CALLBACK controls_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     if (message == WM_NCCREATE) {
@@ -341,7 +380,7 @@ LRESULT CALLBACK controls_proc(HWND window, UINT message, WPARAM wparam, LPARAM 
                 SetFocus(app->preview);
                 return 0;
             }
-            if (id >= 2100 && id < 2107 && event == BN_CLICKED) {
+            if (id >= 2100 && id < 2111 && event == BN_CLICKED) {
                 app->diagnostics.event("activity", markers[id - 2100]);
                 return 0;
             }
@@ -362,7 +401,7 @@ void create_controls(AppState& app, HINSTANCE instance) {
     if (!RegisterClassExW(&kind)) throw std::runtime_error("Controls RegisterClassEx failed");
     app.controls = CreateWindowExW(0, kind.lpszClassName,
         L"EmuScale RTX Settings", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU |
-        WS_MINIMIZEBOX, 80, 80, 650, 505, nullptr,
+        WS_MINIMIZEBOX, 80, 80, 650, 545, nullptr,
         nullptr, instance, &app);
     if (!app.controls) throw std::runtime_error("Controls CreateWindowEx failed");
     auto label = [&](const wchar_t* value, int x, int y, int width) {
@@ -405,10 +444,10 @@ void create_controls(AppState& app, HINSTANCE instance) {
         app.controls, nullptr, instance, nullptr);
     label(L"Distinct timestamps are not proof of distinct game images. F1 reopens this panel.",
           16, 383, 620);
-    for (int i = 0; i < 7; ++i) {
-        const std::wstring labels[] = {L"Explore", L"Combat", L"Travel", L"Menu", L"Loading", L"Effects", L"Stutter"};
+    for (int i = 0; i < 11; ++i) {
+        const std::wstring labels[] = {L"Explore", L"Combat", L"Travel", L"Menu", L"Loading", L"Effects", L"Stutter", L"Camera", L"Window", L"Monitor", L"Capture"};
         CreateWindowExW(0, L"BUTTON", labels[i].c_str(), WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            16 + i * 87, 414, 82, 28, app.controls, reinterpret_cast<HMENU>(static_cast<INT_PTR>(2100 + i)), instance, nullptr);
+            16 + (i % 7) * 87, 414 + (i / 7) * 34, 82, 28, app.controls, reinterpret_cast<HMENU>(static_cast<INT_PTR>(2100 + i)), instance, nullptr);
     }
     if (!app.diagnostic_mode) ShowWindow(app.controls, SW_SHOW);
 }
@@ -423,6 +462,24 @@ LRESULT CALLBACK preview_proc(HWND window, UINT message, WPARAM wparam, LPARAM l
     if (!app) return DefWindowProcW(window, message, wparam, lparam);
     try {
         switch (message) {
+        case set_limit_message:
+            if (wparam <= 8) {
+                app->pacer.set_limit(static_cast<emuscale::FpsLimit>(wparam)); app->diagnostic_runtime->fps_limit = static_cast<int>(wparam);
+                if (app->controls) SendDlgItemMessageW(app->controls, fps_combo_id, CB_SETCURSEL, wparam, 0);
+                app->diagnostics.event("fps_limit", emuscale::utf8(emuscale::fps_limit_name(app->pacer.limit())));
+            }
+            return 0;
+        case set_vsync_message:
+            if (wparam <= 2) {
+                app->renderer.set_vsync(static_cast<emuscale::VSyncMode>(wparam)); app->diagnostic_runtime->vsync = static_cast<int>(wparam);
+                if (app->controls) SendDlgItemMessageW(app->controls, vsync_combo_id, CB_SETCURSEL, wparam, 0);
+                app->diagnostics.event("vsync", emuscale::utf8(emuscale::vsync_name(app->renderer.vsync())));
+            }
+            return 0;
+        case preview_size_message:
+            if (wparam >= 320 && wparam <= 7680 && lparam >= 240 && lparam <= 4320)
+                SetWindowPos(window, nullptr, 0, 0, static_cast<int>(wparam), static_cast<int>(lparam), SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER);
+            return 0;
         case marker_message:
             if (wparam < std::size(markers)) app->diagnostics.event("activity", markers[wparam]);
             return 0;
@@ -434,11 +491,27 @@ LRESULT CALLBACK preview_proc(HWND window, UINT message, WPARAM wparam, LPARAM l
             DestroyWindow(window);
             return 0;
         case emuscale::capture_failed_message:
-            app->status = L"Capture interrupted";
-            app->error = L"Frame acquisition failed (" +
-                hresult_text(app->stats->capture_hresult.load(std::memory_order_relaxed)) + L")";
-            DestroyWindow(window);
+            if (app->stats->capture_failed.load()) request_capture_recovery(*app);
             return 0;
+        case WM_DISPLAYCHANGE: {
+            ++app->diagnostic_runtime->topology_generation;
+            app->diagnostics.event("display_topology_changed", "Windows display-change notification; target unchanged");
+            std::vector<RECT> work;
+            for (const auto& d : emuscale::discover_displays(false)) work.push_back(d.work);
+            for (HWND own : {app->preview, app->controls}) if (own && IsWindow(own)) {
+                RECT before{}; GetWindowRect(own, &before);
+                const auto after = emuscale::visible_preview_rect(before, work);
+                if (!EqualRect(&before, &after)) SetWindowPos(own, nullptr, after.left, after.top, after.right - after.left, after.bottom - after.top, SWP_NOACTIVATE | SWP_NOZORDER);
+            }
+            return 0;
+        }
+        case WM_DPICHANGED: {
+            const auto& suggested = *reinterpret_cast<const RECT*>(lparam);
+            SetWindowPos(window, nullptr, suggested.left, suggested.top, suggested.right - suggested.left, suggested.bottom - suggested.top, SWP_NOACTIVATE | SWP_NOZORDER);
+            ++app->diagnostic_runtime->topology_generation;
+            app->diagnostics.event("preview_dpi_changed", std::to_string(HIWORD(wparam)));
+            return 0;
+        }
         case WM_SIZE:
             if (wparam != SIZE_MINIMIZED)
                 app->renderer.resize(LOWORD(lparam), HIWORD(lparam));
@@ -452,6 +525,18 @@ LRESULT CALLBACK preview_proc(HWND window, UINT message, WPARAM wparam, LPARAM l
             }
             return 0;
         case WM_TIMER:
+            if (app->stats->target_closed.load() || !IsWindow(app->target)) {
+                app->status = L"Target closed; explicit selection required for a recreated window";
+                DestroyWindow(window); return 0;
+            }
+            {
+                DWORD current_pid = 0; GetWindowThreadProcessId(app->target, &current_pid);
+                if (IsWindow(app->target) && current_pid != app->target_pid) {
+                    app->status = L"Target identity changed; explicit re-selection required";
+                    app->diagnostics.event("target_replaced", "Original HWND belongs to a different process; no retargeting");
+                    DestroyWindow(window); return 0;
+                }
+            }
             if (app->diagnostic_mode && app->diagnostic_duration > 0 &&
                 std::chrono::steady_clock::now() - app->capture_started >= std::chrono::seconds(app->diagnostic_duration)) {
                 app->status = L"Timed session complete";
@@ -459,10 +544,7 @@ LRESULT CALLBACK preview_proc(HWND window, UINT message, WPARAM wparam, LPARAM l
                 return 0;
             }
             if (app->stats->capture_failed.load(std::memory_order_relaxed)) {
-                app->status = L"Capture interrupted";
-                app->error = L"Frame acquisition failed (" +
-                    hresult_text(app->stats->capture_hresult.load(std::memory_order_relaxed)) + L")";
-                DestroyWindow(window);
+                request_capture_recovery(*app);
             } else if (app->stats->target_closed.load(std::memory_order_relaxed) ||
                        !IsWindow(app->target)) {
                 app->status = L"Target closed";
@@ -470,8 +552,28 @@ LRESULT CALLBACK preview_proc(HWND window, UINT message, WPARAM wparam, LPARAM l
             } else {
                 update_title(*app);
             }
+            if (app->recovery_pending && IsWindow(window) && emuscale::capturable_window(app->target) && std::chrono::steady_clock::now() >= app->retry_after) {
+                ++app->recovery_attempts;
+                try {
+                    app->stats->capture_failed = false; app->stats->capture_hresult = 0;
+                    app->capture.start(app->target, app->preview, app->renderer.device(), app->stats, app->metrics);
+                    app->recovery_pending = false; app->last_presented_source_ticks = 0;
+                    app->status = L"Capturing (recovered)"; app->recovered_at = std::chrono::steady_clock::now();
+                    app->diagnostics.event("capture_restarted", "Reopened original HWND without window manipulation");
+                } catch (...) {
+                    app->recovery_pending = false;
+                    app->stats->capture_failed = true;
+                    if (app->recovery_attempts >= 3) throw;
+                    request_capture_recovery(*app);
+                }
+            }
+            if (!app->recovery_pending && app->recovered_at != std::chrono::steady_clock::time_point{} &&
+                std::chrono::steady_clock::now() - app->recovered_at > std::chrono::seconds(10) && app->metrics->snapshot(qpc().first, qpc().second).callback_fps > 0) {
+                app->recovery_attempts = 0; app->recovered_at = {};
+            }
             return 0;
         case WM_CLOSE:
+            app->status = L"Stopped by user";
             DestroyWindow(window);
             return 0;
         case WM_DESTROY:
@@ -549,6 +651,8 @@ int run(const Options& opt) {
 
     AppState app;
     app.target = target;
+    app.target_pid = windows[selection - 1].process_id;
+    app.metrics->set_thresholds(opt.warning_ms, opt.spike_ms);
     const HWND foreground_before = GetForegroundWindow();
     RECT target_bounds_before{}; GetWindowRect(target, &target_bounds_before);
     app.diagnostic_mode = opt.diagnostics;
@@ -563,7 +667,7 @@ int run(const Options& opt) {
         app.pacer.set_limit(opt.limit);
         app.renderer.set_vsync(opt.vsync);
     }
-    app.preview = CreateWindowExW(0, window_class.lpszClassName, L"EmuScale RTX v0.1.2",
+    app.preview = CreateWindowExW(0, window_class.lpszClassName, L"EmuScale RTX v0.1.3",
         WS_OVERLAPPEDWINDOW, x, y, width, height,
         nullptr, nullptr, instance, &app);
     if (!app.preview) throw std::runtime_error("CreateWindowEx failed");
@@ -585,6 +689,7 @@ int run(const Options& opt) {
             config.target_process = selected.process_name; config.target_title = selected.title; config.gpu = app.renderer.gpu_name();
             config.scenario = opt.scenario; config.optimizer = opt.optimizer; config.scene = opt.scene; config.ready = opt.ready;
             config.duration_seconds = opt.duration; config.tearing_supported = app.renderer.tearing_supported();
+            config.warning_threshold_ms = opt.warning_ms; config.spike_threshold_ms = opt.spike_ms;
             app.diagnostics.start(benchmark_directory().parent_path() / L"diagnostics", config, app.metrics, app.stats, app.diagnostic_runtime);
             std::wcout << L"[Diagnostics] Recording TotK to " << app.diagnostics.directory().wstring() << L"\n";
         }
@@ -609,13 +714,15 @@ int run(const Options& opt) {
                 (EqualRect(&target_bounds_before, &after) ? "true" : "false") + "; foreground_unchanged=" +
                 (foreground_before == GetForegroundWindow() ? "true" : "false") + "; no target window-management calls issued");
         }
-        SetTimer(app.preview, 1, 1000, nullptr);
+        if (!SetTimer(app.preview, 1, 1000, nullptr)) throw std::runtime_error("Cannot create preview health timer");
 
         MSG message{};
-        while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+        BOOL received = 0;
+        while ((received = GetMessageW(&message, nullptr, 0, 0)) > 0) {
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
+        if (received == -1) throw std::runtime_error("Preview message loop failed");
     } catch (...) {
         app.diagnostics.event("startup_or_loop_error", "Capture startup or message loop raised an exception");
         app.status = L"Capture error";
@@ -626,6 +733,7 @@ int run(const Options& opt) {
         std::wcerr << L"Preview stopped: " << app.error << L"\n";
         return 1;
     }
+    if (app.diagnostics.failed()) return 1;
     return 0;
 }
 } // namespace
@@ -633,24 +741,42 @@ int run(const Options& opt) {
 int wmain(int argc, wchar_t** argv) {
     try {
         if (argc == 2 && std::wstring_view(argv[1]) == L"--help") {
-            std::cout << "EmuScale RTX v0.1.2\nNo arguments: v0.1.1 manual selection and controls.\n"
-                "--diagnostics [--duration=0|30|60|120] [--scenario=A|B|C]\n"
+            std::cout << "EmuScale RTX v0.1.3\nNo arguments: v0.1.1 manual selection and controls.\n"
+                "--diagnostics [--duration=0|30|60|120] [--scenario=A|B|C|D]\n"
                 "[--ready --optimizer=configuration --scene=label] [--vsync=Auto|On|Off]\n"
                 "[--limit=Auto|30|60|90|120|144|165|240|Unlocked] [--target-hwnd=HWND]\n"
-                "--list-eden | --display-info | --stop | --mark=1..7\n"
-                "Markers: 1 Explore, 2 Combat, 3 Travel, 4 Menu, 5 Loading, 6 Effects, 7 Stutter\n";
+                "[--warning-ms=33.3 --spike-ms=50]\n"
+                "--list-eden | --display-info | --stop | --mark=1..11\n"
+                "--set-limit=Auto|30|60|90|120|144|165|240|Unlocked | --set-vsync=Auto|On|Off | --preview-size=800x600\n"
+                "Markers: 1 Explore, 2 Combat, 3 Travel, 4 Menu, 5 Loading, 6 Effects, 7 Stutter, 8 Camera, 9 Window, 10 Monitor, 11 Capture\n";
             return 0;
         }
-        if (argc == 2 && (std::wstring_view(argv[1]) == L"--stop" || std::wstring_view(argv[1]).starts_with(L"--mark="))) {
+        const std::wstring_view command = argc == 2 ? argv[1] : L"";
+        if (argc == 2 && (command == L"--stop" || command.starts_with(L"--mark=") || command.starts_with(L"--set-limit=") || command.starts_with(L"--set-vsync=") || command.starts_with(L"--preview-size="))) {
             HWND preview = FindWindowW(L"EmuScaleRTXPreview", nullptr);
             if (!preview) throw std::runtime_error("No EmuScale preview is running");
             if (FindWindowExW(nullptr, preview, L"EmuScaleRTXPreview", nullptr)) throw std::runtime_error("Multiple EmuScale previews are running; close extras before issuing a command");
-            if (std::wstring_view(argv[1]) == L"--stop") {
+            if (command == L"--stop") {
                 if (!PostMessageW(preview, WM_CLOSE, 0, 0)) throw std::runtime_error("Cannot send stop command");
-            } else {
+            } else if (command.starts_with(L"--mark=")) {
                 const auto value = std::wstring(argv[1]).substr(7);
-                if (value.size() != 1 || value[0] < L'1' || value[0] > L'7') throw std::runtime_error("Marker must be 1..7");
-                if (!PostMessageW(preview, marker_message, value[0] - L'1', 0)) throw std::runtime_error("Cannot send marker");
+                std::size_t end = 0; const int marker = std::stoi(value, &end);
+                if (end != value.size() || marker < 1 || marker > static_cast<int>(std::size(markers))) throw std::runtime_error("Marker must be 1..11");
+                if (!PostMessageW(preview, marker_message, marker - 1, 0)) throw std::runtime_error("Cannot send marker");
+            } else if (command.starts_with(L"--preview-size=")) {
+                const std::wstring value(command.substr(15)); const auto x = value.find(L'x');
+                if (x == std::wstring::npos) throw std::runtime_error("Expected --preview-size=WxH");
+                std::size_t a = 0, b = 0; const auto width = std::stoi(value.substr(0, x), &a), height = std::stoi(value.substr(x + 1), &b);
+                if (a != x || b != value.size() - x - 1 || width < 320 || width > 7680 || height < 240 || height > 4320) throw std::runtime_error("Preview size outside bounds");
+                if (!PostMessageW(preview, preview_size_message, width, height)) throw std::runtime_error("Cannot resize preview");
+            } else {
+                const bool limit = command.starts_with(L"--set-limit=");
+                const auto translated = std::wstring(limit ? L"--limit=" : L"--vsync=") + std::wstring(command.substr(12));
+                wchar_t name[] = L"emuscale_rtx";
+                wchar_t* args[] = {name, const_cast<wchar_t*>(translated.c_str())};
+                const auto parsed = options(2, args);
+                if (!PostMessageW(preview, limit ? set_limit_message : set_vsync_message,
+                    limit ? static_cast<WPARAM>(parsed.limit) : static_cast<WPARAM>(parsed.vsync), 0)) throw std::runtime_error("Cannot send settings command");
             }
             return 0;
         }
